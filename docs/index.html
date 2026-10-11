@@ -826,7 +826,12 @@
     }
 
     /* ===== FOOTER ===== */
-    footer {
+    .support { text-align: center; }
+.support-kofi { display: inline-block; margin-top: 8px; transition: transform 0.15s ease; }
+.support-kofi:hover { transform: translateY(-2px); }
+.support-kofi img { height: 44px; width: auto; border: 0; display: block; }
+
+footer {
       padding: var(--sp-12) 0;
       border-top: 1px solid var(--border-subtle);
     }
@@ -1463,6 +1468,22 @@
     </div>
   </section>
 
+  <!-- SUPPORT -->
+  <section class="support" id="support">
+    <div class="container">
+      <div class="section-header-center">
+        <div class="section-label">Support</div>
+        <h2 class="section-title">Support uvr</h2>
+        <p class="section-desc">
+          uvr is free and MIT-licensed. If it saves you time, you can support its development on Ko-fi.
+        </p>
+      </div>
+      <a class="support-kofi" href="https://ko-fi.com/nbafrank" target="_blank" rel="noopener noreferrer">
+        <img src="https://storage.ko-fi.com/cdn/kofi2.png?v=6" alt="Buy Me a Coffee at ko-fi.com" height="44">
+      </a>
+    </div>
+  </section>
+
   <!-- FOOTER -->
   <footer>
     <div class="container">
@@ -1478,6 +1499,7 @@
           <li><a href="https://github.com/nbafrank/uvr" target="_blank" rel="noopener noreferrer">GitHub</a></li>
           <li><a href="https://github.com/nbafrank/uvr/issues" target="_blank" rel="noopener noreferrer">Issues</a></li>
           <li><a href="https://github.com/nbafrank/uvr-r" target="_blank" rel="noopener noreferrer">R Package</a></li>
+          <li><a href="https://ko-fi.com/nbafrank" target="_blank" rel="noopener noreferrer">Support</a></li>
         </ul>
       </div>
     </div>
