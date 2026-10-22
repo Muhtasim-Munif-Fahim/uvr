@@ -7,6 +7,40 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+## v0.4.8 (2026-10-22)
+
+Scripts become self-contained: a `# /// script` header can pin versions,
+Bioconductor and git packages, and the R version itself, which `uvr run`
+installs when it is missing; `uvr add/remove --script` edit the header for
+you. Resolution gets uv's controls: test your declared floors with
+`--resolution lowest-direct`, reproduce an old analysis with
+`--exclude-newer <date>`, force or bound a transitive dependency with
+`[override-dependencies]` / `[constraint-dependencies]`, and move one
+package with `uvr lock -P`. Also: an opt-in host pin for repository
+credentials, `uvr sync` no longer deletes packages it did not install, and
+security updates for rustls, webpki and zip.
+
+Three adversarial reviews ran before this tag. They found that a cloned
+`uvr.lock` could steer a cache path through its snapshot date, that a date
+set with `--exclude-newer` was silently dropped by the next `uvr add`, and
+that `uvr run` mixed install output into a script's stdout. All are fixed
+here.
+
+Changes that may need action:
+- **`pkg = "==1.0.8"` now means exactly 1.0.8.** It used to match a
+  four-part release such as 1.0.8.3. uvr now locks 1.0.8 itself (from the
+  CRAN archive if needed), or fails if no repository has it.
+- **Repository tokens:** set `UVR_REPO_HOST_<NAME>` to your repository's
+  host, so a cloned `uvr.toml` that reuses the repository name cannot
+  receive the token.
+- **Shells activated with v0.4.7 or earlier:** start a new shell before
+  activating again with v0.4.8.
+
+Known issues, for v0.4.9: with old CRAN releases loaded (lowest modes,
+overrides), a four-part version such as 1.0.8.3 sorts below 1.0.8; and
+`uvr_deactivate` removes a Python venv's `deactivate` when the venv was
+activated after uvr.
+
 - **Pre-release review fixes.** `uvr run` writes uvr's own status lines
   (install summaries, package-name notes) to stderr, so a script's stdout
   holds only what the script prints. A script header in a file that starts
