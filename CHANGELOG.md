@@ -7,6 +7,15 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **`uvr lock --upgrade-package <pkg>` (`-P`) upgrades one package in
+  `uvr.lock` and nothing else** (#196). It is the lock-only form of
+  `uvr update <pkg>` and uses the same resolution: every other package is
+  held at its locked version, and a conflict with a held-back package is an
+  error that leaves `uvr.lock` unchanged. It installs nothing, so you can
+  review a single bump before `uvr sync`. A second run with nothing newer
+  does not write the file and says so. The flag is repeatable and cannot be
+  combined with `--upgrade`.
+
 - **`uvr add --script` and `uvr remove --script` edit a script's inline
   header** (#184), like `uv add --script`. `uvr add <pkg…> --script s.R`
   creates the `# /// script` block when there is none (after a shebang line),
