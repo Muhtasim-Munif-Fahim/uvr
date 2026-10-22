@@ -7,6 +7,16 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Resolve to the lowest allowed versions, so declared floors get tested**
+  (#193). `uvr lock`, `uvr add`, and `uvr update` accept
+  `--resolution {highest,lowest,lowest-direct}`, and `uvr.toml` accepts
+  `[resolution] strategy`. `lowest` picks the oldest release that every
+  constraint allows, for all packages, as uv does. `lowest-direct` lowers
+  only the project's own dependencies. CRAN's index lists only current
+  releases, so uvr reads older releases from crandb (METACRAN), caches them,
+  and locks their CRAN Archive URL. A release that needs a package that has
+  left CRAN is skipped. The default (`highest`) is unchanged.
+
 - **`uvr lock --upgrade-package <pkg>` (`-P`) upgrades one package in
   `uvr.lock` and nothing else** (#196). It is the lock-only form of
   `uvr update <pkg>` and uses the same resolution: every other package is

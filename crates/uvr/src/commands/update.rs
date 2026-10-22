@@ -1,14 +1,20 @@
 use anyhow::{Context, Result};
 
 use uvr_core::lockfile::Lockfile;
+use uvr_core::manifest::ResolutionStrategy;
 use uvr_core::project::Project;
 
-use crate::commands::lock::{resolve_and_lock, resolve_only_upgraded, targeted_upgrade_pins};
+use crate::commands::lock::{resolve_and_lock_with, resolve_only_upgraded, targeted_upgrade_pins};
 use crate::commands::sync::install_from_lockfile;
 use crate::ui;
 use crate::ui::palette;
 
-pub async fn run(packages: Vec<String>, dry_run: bool, jobs: usize) -> Result<()> {
+pub async fn run(
+    packages: Vec<String>,
+    dry_run: bool,
+    jobs: usize,
+    resolution: Option<ResolutionStrategy>,
+) -> Result<()> {
     let project = Project::find_cwd().context("Not inside a uvr project")?;
 
     // Load the current lockfile to compare versions after re-resolution.
@@ -49,7 +55,7 @@ pub async fn run(packages: Vec<String>, dry_run: bool, jobs: usize) -> Result<()
     let effective_lockfile: Lockfile = if !packages.is_empty() {
         // Also verifies each requested package is a manifest dependency.
         let pins = targeted_upgrade_pins(&project.manifest, old_lockfile.as_ref(), &packages)?;
-        let resolved = resolve_only_upgraded(&project, pins)
+        let resolved = resolve_only_upgraded(&project, pins, resolution)
             .await
             .with_context(|| {
                 format!(
@@ -67,9 +73,9 @@ pub async fn run(packages: Vec<String>, dry_run: bool, jobs: usize) -> Result<()
         }
         resolved
     } else if dry_run {
-        resolve_only_upgraded(&project, std::collections::HashMap::new()).await?
+        resolve_only_upgraded(&project, std::collections::HashMap::new(), resolution).await?
     } else {
-        resolve_and_lock(&project, true).await?
+        resolve_and_lock_with(&project, true, resolution).await?
     };
 
     // Compute diff
