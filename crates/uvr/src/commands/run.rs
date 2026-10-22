@@ -18,6 +18,10 @@ pub async fn run(
     with_packages: Vec<String>,
     args: Vec<String>,
 ) -> Result<()> {
+    // Whatever R prints is the command's output (`uvr run x.R > out.csv`),
+    // so uvr's own status lines, such as an install summary, go to stderr.
+    crate::ui::reserve_stdout();
+
     // A script carrying an inline dependency header runs *standalone*: the
     // surrounding project is ignored entirely, which is exactly what lets the
     // same file reproduce in any directory on anyone's machine (#181).
@@ -264,14 +268,23 @@ fn fallback_library() -> PathBuf {
 /// beside a header's `ggplot2>=3.4`). Two different real specs for one
 /// package are an error: the manifest holds one spec per name, so one of
 /// them would otherwise be dropped without a word.
+///
+/// A git or URL entry is named after its repository or file until its
+/// DESCRIPTION is read, so two of them sharing a name (`.../main.tar.gz`)
+/// are both kept here; the caller checks again once the names are real.
 fn canonical_deps(deps: &[(String, DependencySpec)]) -> Result<Vec<(String, DependencySpec)>> {
     let bare = DependencySpec::default();
+    let provisional = |spec: &DependencySpec| spec.git().is_some() || spec.url().is_some();
     let mut sorted = deps.to_vec();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    // By name, then by spec, so the same set in any order gives one key.
+    sorted.sort_by_cached_key(|(name, spec)| (name.clone(), cache_entry(name, spec)));
     let mut out: Vec<(String, DependencySpec)> = Vec::with_capacity(sorted.len());
     for (name, spec) in sorted {
         match out.last_mut() {
-            Some((prev, prev_spec)) if *prev == name => {
+            Some((prev, prev_spec))
+                if *prev == name
+                    && !(provisional(prev_spec) && provisional(&spec) && *prev_spec != spec) =>
+            {
                 if *prev_spec == bare {
                     *prev_spec = spec;
                 } else if spec != bare && spec != *prev_spec {
@@ -376,6 +389,8 @@ async fn ensure_with_env(deps: &[(String, DependencySpec)], r_version: &str) -> 
     // run; record the resolved names in the env dir if that ever matters.
     crate::commands::add::resolve_git_pkg_names(&mut deps).await?;
     crate::commands::add::resolve_url_pkg_names(&mut deps).await?;
+    // Real names now: two entries for one package are a conflict again.
+    let deps = canonical_deps(&deps)?;
     if all_installed(&deps) {
         return Ok(lib_dir);
     }
@@ -558,6 +573,29 @@ mod tests {
             canonical_deps(&reversed).unwrap(),
             canonical_deps(&deps).unwrap()
         );
+    }
+
+    #[test]
+    fn git_and_url_entries_sharing_a_placeholder_name_are_both_kept() {
+        let url = |u: &str| {
+            DependencySpec::Detailed(uvr_core::manifest::DetailedDep {
+                url: Some(u.into()),
+                ..Default::default()
+            })
+        };
+        let a = url("https://github.com/a/pkga/archive/refs/heads/main.tar.gz");
+        let b = url("https://github.com/b/pkgb/archive/refs/heads/main.tar.gz");
+        let deps = vec![("main".to_string(), a.clone()), ("main".to_string(), b)];
+        assert_eq!(canonical_deps(&deps).unwrap().len(), 2);
+        // Either order gives one environment.
+        let reversed: Vec<_> = deps.iter().rev().cloned().collect();
+        assert_eq!(
+            canonical_deps(&deps).unwrap(),
+            canonical_deps(&reversed).unwrap()
+        );
+        // The same entry twice is still one.
+        let twice = vec![("main".to_string(), a.clone()), ("main".to_string(), a)];
+        assert_eq!(canonical_deps(&twice).unwrap().len(), 1);
     }
 
     #[test]

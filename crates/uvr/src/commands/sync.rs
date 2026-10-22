@@ -1071,10 +1071,10 @@ async fn install_from_lockfile_with_r(
         // indicate "no binaries available" — those packages simply have no binary form.
         // A binary plan means a repo exists; it just served source (#225).
         if runtime_binary == 0 && runtime_source > 0 && !plans.iter().any(|p| p.is_binary) {
-            println!(
+            ui::line(format!(
                 "  i  No binary repo for {} on R {}; compiling {} package(s) from source.",
                 host_info.distro_label, r_minor_str, runtime_source
-            );
+            ));
         }
 
         // Check for missing system dependencies: the tarballs are on disk
@@ -1852,9 +1852,10 @@ pub(super) fn validate_frozen_lock(project: &Project, lockfile: &Lockfile) -> Re
     }
     validate_locked_manifest(project, lockfile)?;
 
-    // The fingerprint covers `[resolution] exclude-newer`, but not a lock
-    // made with an `--exclude-newer` override: its date is only in the lock.
-    // A lock made at another date (or live) is out of date (#194). The
+    // The fingerprint covers `[resolution] exclude-newer`. When uvr.toml
+    // names a date, a lock made at another date (or live) is out of date
+    // (#194). When it names none, a dated lock came from `uvr lock
+    // --exclude-newer` and is current, as a `--resolution` lock is. The
     // manifest date is normalized as `uvr lock` does it; a date with no
     // snapshot is an error here too.
     let wanted = project
@@ -1862,7 +1863,7 @@ pub(super) fn validate_frozen_lock(project: &Project, lockfile: &Lockfile) -> Re
         .exclude_newer()
         .map(uvr_core::registry::cran::snapshot_date)
         .transpose()?;
-    if lockfile.r.resolved_as_of != wanted {
+    if wanted.is_some() && lockfile.r.resolved_as_of != wanted {
         let describe = |date: Option<&str>| match date {
             Some(date) => format!("as of {date}"),
             None => "without a date limit".to_string(),
@@ -2797,9 +2798,10 @@ mod tests {
     }
 
     #[test]
-    fn frozen_lock_made_at_another_date_is_out_of_date() {
-        // #194: `--exclude-newer` on `uvr lock` leaves uvr.toml unchanged, so
-        // only the lock's `resolved_as_of` shows that the date differs.
+    fn frozen_lock_date_must_match_a_manifest_date() {
+        // #194: a lock dated by `uvr lock --exclude-newer` is current while
+        // uvr.toml names no date, as a `--resolution` lock is. Once uvr.toml
+        // names one, the lock must have been resolved at that date.
         let temp = tempfile::TempDir::new().unwrap();
         let mut manifest = uvr_core::manifest::Manifest::new("research", None);
         manifest.add_dep(
@@ -2807,24 +2809,40 @@ mod tests {
             uvr_core::manifest::DependencySpec::Version("*".into()),
             false,
         );
-        manifest.write(&temp.path().join("uvr.toml")).unwrap();
-        let project = Project::find(temp.path()).unwrap();
-        let lock = |as_of: Option<&str>| Lockfile {
-            manifest_fingerprint: Some(manifest.lock_fingerprint().unwrap()),
-            r: RVersionPin {
-                version: "*".into(),
-                bioc_version: None,
-                resolved_as_of: as_of.map(str::to_string),
-            },
-            packages: vec![locked_pkg(
-                "rlang",
-                "1.1.6",
-                "https://cran.example/rlang.tar.gz",
-            )],
+        let check = |manifest: &uvr_core::manifest::Manifest, as_of: Option<&str>| {
+            // A new file each time: `write` keeps an existing uvr.toml's
+            // `[resolution]`, which no command edits.
+            let path = temp.path().join("uvr.toml");
+            let _ = std::fs::remove_file(&path);
+            manifest.write(&path).unwrap();
+            let project = Project::find(temp.path()).unwrap();
+            let lock = Lockfile {
+                manifest_fingerprint: Some(manifest.lock_fingerprint().unwrap()),
+                r: RVersionPin {
+                    version: "*".into(),
+                    bioc_version: None,
+                    resolved_as_of: as_of.map(str::to_string),
+                },
+                packages: vec![locked_pkg(
+                    "rlang",
+                    "1.1.6",
+                    "https://cran.example/rlang.tar.gz",
+                )],
+            };
+            validate_frozen_lock(&project, &lock)
         };
-        validate_frozen_lock(&project, &lock(None)).unwrap();
-        let err = validate_frozen_lock(&project, &lock(Some("2024-01-01"))).unwrap_err();
-        assert!(err.to_string().contains("as of 2024-01-01"), "{err}");
+        check(&manifest, None).unwrap();
+        check(&manifest, Some("2024-01-01")).unwrap();
+
+        manifest.resolution = Some(uvr_core::manifest::ResolutionConfig {
+            exclude_newer: Some("2024-01-01".into()),
+            ..Default::default()
+        });
+        check(&manifest, Some("2024-01-01")).unwrap();
+        for other in [None, Some("2023-06-01")] {
+            let err = check(&manifest, other).unwrap_err();
+            assert!(err.to_string().contains("as of 2024-01-01"), "{err}");
+        }
     }
 
     #[test]

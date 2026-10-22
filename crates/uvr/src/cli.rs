@@ -170,7 +170,7 @@ pub struct AddArgs {
         value_name = "FILE",
         conflicts_with_all = [
             "dev", "source", "no_lock", "no_install", "jobs", "timeout",
-            "install_system_deps", "no_binary",
+            "install_system_deps", "no_binary", "resolution",
         ],
     )]
     pub script: Option<PathBuf>,

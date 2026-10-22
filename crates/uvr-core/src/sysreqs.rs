@@ -584,6 +584,11 @@ fn package_query() -> Option<(&'static str, &'static [&'static str])> {
 }
 
 fn query_installed(cmd: &str, args: &[&str], package: &str) -> Option<bool> {
+    // Names come from a remote catalog; one starting with `-` would reach
+    // dpkg/rpm/apk as an option. No real package name does.
+    if package.is_empty() || package.starts_with('-') {
+        return None;
+    }
     std::process::Command::new(cmd)
         .args(args)
         .arg(package)
@@ -937,6 +942,14 @@ mod tests {
             "child did not run sysreqs::tests::{test}"
         );
         false
+    }
+
+    #[test]
+    fn a_name_that_looks_like_an_option_is_never_probed() {
+        // `true` would report "installed" for anything it is given.
+        for name in ["--root=/x", "-q", ""] {
+            assert_eq!(query_installed("true", &[], name), None, "{name:?}");
+        }
     }
 
     #[cfg(unix)]

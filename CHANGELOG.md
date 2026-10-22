@@ -7,6 +7,16 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Pre-release review fixes.** `uvr run` writes uvr's own status lines
+  (install summaries, package-name notes) to stderr, so a script's stdout
+  holds only what the script prints. A script header in a file that starts
+  with a UTF-8 BOM is read, and `uvr add --script` no longer adds a second
+  header below it. Two git or URL header entries whose file names match
+  (`.../main.tar.gz`) no longer fail as "requested twice". `uvr add --script`
+  refuses `--resolution`, which it would ignore. In the default resolution
+  mode, an unreachable crandb no longer hides the resolver's own error. A
+  system package name that starts with `-` is never passed to dpkg/rpm/apk.
+
 - **Security updates for dependencies.** rustls 0.23.46, rustls-webpki
   0.103.16, webpki-roots and webpki-root-certs 1.0.10 (distrusted emSign
   intermediates), quinn-proto 0.11.18, and zip 9. uvr extracts zip archives
@@ -26,7 +36,10 @@ Pure tracking section — fixes and small features land here between tags.
   `uvr lock --exclude-newer 2024-01-01`, or `[resolution] exclude-newer` in
   `uvr.toml`, resolves CRAN packages from the Posit Package Manager snapshot
   for that day. `uvr.lock` records the date as `resolved_as_of`, and
-  `uvr sync` installs the P3M binaries from the same snapshot. Bioconductor,
+  `uvr sync` installs the P3M binaries from the same snapshot. A date given
+  only on the command line stays in the lock: later `uvr add`, `uvr remove`,
+  `uvr lock -P` and `uvr update <pkg>` resolve at the same date until
+  `uvr.toml` names one or `uvr lock --upgrade` moves to today's CRAN. Bioconductor,
   custom repositories, and git dependencies have no dated snapshot: uvr warns
   once and resolves them from their current state. Without the option,
   resolution is unchanged.

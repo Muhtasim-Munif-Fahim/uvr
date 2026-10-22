@@ -123,8 +123,24 @@ pub async fn resolve_only_upgraded(
     strategy: Option<ResolutionStrategy>,
 ) -> Result<Lockfile> {
     let client = build_client()?;
-    // --upgrade: don't reuse locked bioc_version, re-detect fresh
-    resolve_lockfile(project, &client, true, None, pins, strategy, None).await
+    // --upgrade: don't reuse locked bioc_version, re-detect fresh. A dated
+    // lock keeps its date: the held-back packages come from that snapshot,
+    // and the upgraded ones must too.
+    let date = project
+        .load_lockfile()
+        .ok()
+        .flatten()
+        .and_then(|lf| lf.r.resolved_as_of);
+    resolve_lockfile(
+        project,
+        &client,
+        true,
+        None,
+        pins,
+        strategy,
+        date.as_deref(),
+    )
+    .await
 }
 
 /// Core resolution logic shared by `resolve_and_lock` and `resolve_only`.
@@ -142,8 +158,15 @@ async fn resolve_lockfile(
     exclude_newer: Option<&str>,
 ) -> Result<Lockfile> {
     let strategy = strategy.unwrap_or_else(|| project.manifest.resolution_strategy());
+    // A date from `--exclude-newer` lives only in the lock. It stays there
+    // until uvr.toml names a date or `--upgrade` asks for today's CRAN, so a
+    // later `uvr add` or `uvr lock -P` does not quietly move every package
+    // to its current release.
     let as_of = exclude_newer
         .or(project.manifest.exclude_newer())
+        .or(existing
+            .filter(|_| !upgrade)
+            .and_then(|lf| lf.r.resolved_as_of.as_deref()))
         .map(snapshot_date)
         .transpose()?;
     if let Some(date) = &as_of {
@@ -342,9 +365,17 @@ async fn resolve_lockfile(
         if wanted.is_empty() {
             break result.context("Dependency resolution failed")?;
         }
-        cran.load_history(client, wanted)
-            .await
-            .context("Failed to load older CRAN releases")?;
+        if let Err(e) = cran.load_history(client, wanted).await {
+            // Under `highest` the history is only wanted because a bound
+            // excluded the current release; without it, the resolver's own
+            // error ("no version satisfies ...") is the one to show. The
+            // lowest modes need it to mean anything, so they fail.
+            if strategy != ResolutionStrategy::Highest {
+                return Err(e).context("Failed to load older CRAN releases");
+            }
+            tracing::warn!("Could not load older CRAN releases: {e}");
+            break result.context("Dependency resolution failed")?;
+        }
     };
     lockfile.r.resolved_as_of = as_of;
 

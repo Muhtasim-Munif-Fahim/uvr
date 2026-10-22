@@ -119,6 +119,8 @@ fn parse_err(message: String) -> UvrError {
 /// A file may declare at most one block: a second `# /// script` fence after
 /// the first block closes is an error, never silently discarded.
 pub fn parse(source: &str) -> Result<Option<ScriptHeader>> {
+    // A UTF-8 BOM would hide a fence on the first line.
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut lines = source.lines();
 
     // Scan for the opening fence. Anything before it is ordinary script
@@ -217,7 +219,16 @@ fn body_content(line: &str) -> Option<&str> {
 /// of the file stay byte for byte, line endings included. Entries keep the
 /// spelling they were written with; new ones use [`dep_spec::format`]'s.
 pub fn upsert(source: &str, add: &[(String, DependencySpec)]) -> Result<String> {
-    edit(source, &[], add)
+    without_bom(source, |source| edit(source, &[], add))
+}
+
+/// Edit `source` without its UTF-8 BOM, and put the BOM back on the result,
+/// so the header goes at the very top and every fence match sees the line.
+fn without_bom(source: &str, edit: impl FnOnce(&str) -> Result<String>) -> Result<String> {
+    match source.strip_prefix('\u{feff}') {
+        Some(rest) => Ok(format!("\u{feff}{}", edit(rest)?)),
+        None => edit(source),
+    }
 }
 
 /// Drop every entry for the packages in `names` — `uvr remove --script`.
@@ -227,7 +238,7 @@ pub fn upsert(source: &str, add: &[(String, DependencySpec)]) -> Result<String> 
 /// to a headerless file restores it exactly. Names not in the header are
 /// ignored; the caller says so.
 pub fn remove(source: &str, names: &[String]) -> Result<String> {
-    edit(source, names, &[])
+    without_bom(source, |source| edit(source, names, &[]))
 }
 
 /// The `dependencies` value, with the byte span of the array and of each
@@ -474,12 +485,7 @@ fn create(source: &str, add: &[(String, DependencySpec)]) -> Result<String> {
         Some(l) if l.ends_with("\r\n") => "\r\n",
         _ => "\n",
     };
-    // A BOM is kept first too: `parse` would not see a fence behind it.
-    let after = usize::from(
-        lines
-            .first()
-            .is_some_and(|l| l.starts_with("#!") || l.starts_with('\u{feff}')),
-    );
+    let after = usize::from(lines.first().is_some_and(|l| l.starts_with("#!")));
     let mut out = lines[..after].concat();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push_str(eol);
@@ -1003,6 +1009,22 @@ library(jsonlite)
             assert_eq!(deps(&out), vec!["cli", "ggplot2"], "{source:?}");
             assert_eq!(drop(&out, &["ggplot2", "cli"]), source, "{source:?}");
         }
+    }
+
+    #[test]
+    fn a_bom_neither_hides_a_header_nor_moves_a_new_one() {
+        // A header on the BOM line is found and edited in place.
+        let source = "\u{feff}# /// script\n# dependencies = [\"cli\"]\n# ///\nprint(1)\n";
+        assert_eq!(deps(source), vec!["cli"]);
+        let out = add(source, &["jsonlite"]);
+        assert!(out.starts_with("\u{feff}# /// script\n"), "{out:?}");
+        assert_eq!(out.matches(FENCE_OPEN).count(), 1, "{out:?}");
+        assert_eq!(deps(&out), vec!["cli", "jsonlite"]);
+
+        // A new header goes above the first line of code, not after it.
+        let out = add("\u{feff}x <- c(1,\n2)\n", &["cli"]);
+        assert!(out.starts_with("\u{feff}# /// script\n"), "{out:?}");
+        assert!(out.ends_with("\n\nx <- c(1,\n2)\n"), "{out:?}");
     }
 
     #[test]

@@ -721,11 +721,13 @@ a date in the future is an error.
 - The snapshot shows CRAN as Package Manager copied it on that day. Package
   Manager can be some days behind CRAN, thus a release that CRAN published a
   short time before the date can be absent.
-- `--exclude-newer <DATE>` on `uvr lock` overrides the setting for one run.
-  As with `--resolution`, `uvr add`, `uvr sync --frozen`, and later `uvr lock`
-  runs use the `uvr.toml` setting. Thus, to keep a date, write it in
-  `uvr.toml`. `uvr sync --frozen` fails when the date in `uvr.lock` is not
-  the date in `uvr.toml`.
+- `--exclude-newer <DATE>` on `uvr lock` sets the date without editing
+  `uvr.toml`. The date is kept in `uvr.lock`: later `uvr add`, `uvr remove`,
+  `uvr lock -P` and `uvr update <pkg>` runs resolve at the same date, until
+  `uvr.toml` names a date or `uvr lock --upgrade` resolves against today's
+  CRAN. To share the date with collaborators, write it in `uvr.toml`. When
+  `uvr.toml` names a date, `uvr sync --frozen` fails if `uvr.lock` was
+  resolved at another one.
 - With `--resolution lowest`, releases that are older than the snapshot's
   release download from the CRAN archive, where their MD5 checksum applies.
 - Bioconductor packages, `[[sources]]` repositories, and git dependencies have
