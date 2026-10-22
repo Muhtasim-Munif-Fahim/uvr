@@ -33,8 +33,9 @@
 //!
 //! Each entry is a dependency spec in the grammar `uvr add` takes
 //! ([`crate::dep_spec`]), so a header can pin versions and name
-//! Bioconductor or git sources (#182). The `r` version pin arrives with
-//! #183 and is only captured here.
+//! Bioconductor or git sources (#182). An optional `r = ">=4.3"` names the
+//! R the script needs, in `uvr.toml`'s `r_version` grammar; `uvr run`
+//! selects or installs a matching R (#183).
 
 use serde::Deserialize;
 
@@ -54,7 +55,7 @@ pub struct ScriptHeader {
     /// `uvr add` produces.
     pub dependencies: Vec<(String, DependencySpec)>,
 
-    /// R version constraint. Parsed but not yet acted on — see [`parse`].
+    /// R version constraint, validated by [`parse`]; `uvr run` honours it (#183).
     pub r: Option<String>,
 }
 
@@ -109,9 +110,8 @@ fn parse_err(message: String) -> UvrError {
 /// a typo in the fence would otherwise drop every declared dependency and
 /// fail later as a confusing missing-package error.
 ///
-/// `r` is parsed but not applied — R-version pinning lands in #183. Callers
-/// should tell the user it was ignored rather than silently running against
-/// whichever R they happen to have.
+/// An `r` value that is not a valid version constraint is an error here, not
+/// a failed R lookup (or download attempt) later.
 ///
 /// A file may declare at most one block: a second `# /// script` fence after
 /// the first block closes is an error, never silently discarded.
@@ -160,6 +160,14 @@ pub fn parse(source: &str) -> Result<Option<ScriptHeader>> {
             "unterminated `{FENCE_OPEN}` block: no closing `{FENCE_CLOSE}` line"
         )));
     };
+
+    if let Some(r) = &header.r {
+        crate::resolver::parse_version_req(r).map_err(|e| {
+            parse_err(format!(
+                "`r = {r:?}` is not a valid R version constraint: {e}"
+            ))
+        })?;
+    }
 
     let mut dependencies = Vec::with_capacity(header.dependencies.len());
     for spec in &header.dependencies {
@@ -325,9 +333,8 @@ library(ggplot2)
     }
 
     #[test]
-    fn an_r_pin_is_captured_even_though_it_is_not_applied_yet() {
-        // Captured so the caller can say it was ignored (#183). Dropping it
-        // silently would run the script against the wrong R with no signal.
+    fn an_r_constraint_is_captured() {
+        // `uvr run` selects, or installs, a matching R from it (#183).
         let source = "# /// script\n# r = \">=4.3\"\n# dependencies = [\"cli\"]\n# ///\n";
         let header = parse(source).unwrap().unwrap();
         assert_eq!(header.r.as_deref(), Some(">=4.3"));
@@ -521,5 +528,21 @@ print(1)
         let source = "# /// script\n# x = \"\u{1b}[31mFAKE\"\n# ///\n";
         let err = parse(source).unwrap_err().to_string();
         assert!(!err.contains('\u{1b}'), "raw ESC leaked: {err:?}");
+    }
+
+    #[test]
+    fn an_invalid_r_constraint_is_an_error() {
+        // Refused here, so it never reaches R lookup as a bare semver error
+        // — or as a reason to download an R (#183). The message quotes the
+        // value, so it must be sanitized like every other one.
+        for r in ["four", ">=", "4.x", "\\u001b[31m>=4.3"] {
+            let source = format!("# /// script\n# r = \"{r}\"\n# ///\n");
+            let err = parse(&source).unwrap_err().to_string();
+            assert!(
+                err.contains("not a valid R version constraint"),
+                "{r}: {err}"
+            );
+            assert!(!err.contains('\u{1b}'), "raw ESC leaked: {err:?}");
+        }
     }
 }

@@ -813,6 +813,26 @@ fn pick_newest_matching(available: &[String], prefix: &str) -> Option<String> {
         .cloned()
 }
 
+/// Newest entry of `available` (sorted oldest-first, as
+/// [`fetch_available_versions`] returns it) that satisfies `constraint`.
+///
+/// `constraint` uses the grammar of `uvr.toml`'s `r_version`, through the
+/// same [`r_version_satisfies`](crate::r_version::detector::r_version_satisfies)
+/// that picks an installed R: a bare `4.4` is any 4.4.x and `4.4.3` is
+/// exactly that release (#320), while `>=4.4` or `^4.4` is a requirement.
+/// Used to provision the R a script header asks for (#183); any other
+/// grammar here would install an R the lookup afterwards rejects.
+pub fn newest_satisfying(available: &[String], constraint: &str) -> Result<Option<String>> {
+    // Fail on a bad constraint even when `available` is empty.
+    crate::resolver::parse_version_req(constraint.trim())?;
+    for v in available.iter().rev() {
+        if crate::r_version::detector::r_version_satisfies(constraint, v)? {
+            return Ok(Some(v.clone()));
+        }
+    }
+    Ok(None)
+}
+
 /// Build a helpful error when the portable CDN returns 4xx for a requested R
 /// version. Best-effort: queries `versions.json` so users see "latest available
 /// is 4.5.3" instead of a bare "404 Not Found".
@@ -946,7 +966,13 @@ pub async fn fetch_available_versions(
         .error_for_status()?
         .bytes()
         .await?;
-    let json: serde_json::Value = serde_json::from_slice(&body)
+    parse_available_versions(&body, platform)
+}
+
+/// The parsing half of [`fetch_available_versions`], split out so the
+/// per-platform filtering can be tested without the network.
+fn parse_available_versions(body: &[u8], platform: Platform) -> Result<AvailableVersions> {
+    let json: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| UvrError::Other(format!("Failed to parse versions.json: {e}")))?;
     let arr = json
         .get("r_versions")
@@ -1326,6 +1352,42 @@ mod tests {
             pick_newest_matching(&available, "4").as_deref(),
             Some("4.6.0")
         );
+    }
+
+    #[test]
+    fn newest_satisfying_picks_the_newest_release_a_constraint_allows() {
+        let available: Vec<String> = ["4.3.3", "4.4.0", "4.4.3", "4.5.3", "4.6.1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pick = |c: &str| newest_satisfying(&available, c).unwrap();
+        assert_eq!(pick(">=4.3").as_deref(), Some("4.6.1"));
+        assert_eq!(pick("~4.4").as_deref(), Some("4.4.3"));
+        assert_eq!(pick("==4.4.0").as_deref(), Some("4.4.0"));
+        assert_eq!(pick(">=4.3, <4.5").as_deref(), Some("4.4.3"));
+        // `uvr.toml` grammar: a bare version is a pin (#320), so `4.4` is
+        // the newest 4.4.x and `4.4.0` is that release. A caret has to be
+        // written out.
+        assert_eq!(pick("4.4").as_deref(), Some("4.4.3"));
+        assert_eq!(pick("4.4.0").as_deref(), Some("4.4.0"));
+        assert_eq!(pick("^4.4").as_deref(), Some("4.6.1"));
+        assert_eq!(pick(">=99"), None);
+        assert!(newest_satisfying(&available, "not a constraint").is_err());
+    }
+
+    #[test]
+    fn newest_satisfying_only_sees_what_the_platform_publishes() {
+        // The index lists 4.0.5 for every platform, but only Linux has it.
+        // Asking for `<4.1` must fall back to what the CDN really serves
+        // (3.6.3 on Windows, nothing on macOS) rather than to a 403 (#215).
+        let index = br#"{"r_versions": ["next", "devel", "4.1.0", "4.0.5", "3.6.3", "3.6.2"]}"#;
+        let pick = |p: Platform| {
+            let available = parse_available_versions(index, p).unwrap();
+            newest_satisfying(&available.stable, "<4.1").unwrap()
+        };
+        assert_eq!(pick(Platform::LinuxX86_64).as_deref(), Some("4.0.5"));
+        assert_eq!(pick(Platform::WindowsX86_64).as_deref(), Some("3.6.3"));
+        assert_eq!(pick(Platform::MacOsArm64), None);
     }
 
     #[test]
