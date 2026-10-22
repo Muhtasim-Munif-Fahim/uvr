@@ -363,22 +363,37 @@ pub async fn run(
     }
 
     for (name, spec) in &parsed {
-        let is_new = project.manifest.add_dep(name.clone(), spec.clone(), dev);
-        if is_new {
-            println!(
-                "{} {} {}",
-                palette::added(ui::glyph::add()),
-                palette::pkg(name),
-                palette::version(format_spec(spec))
-            );
-        } else {
-            println!(
-                "{} {} {} {}",
+        let (change, spec) = apply_add(&mut project.manifest, name, spec.clone(), dev);
+        let (glyph, note) = match change {
+            AddChange::Added => (palette::added(ui::glyph::add()), None),
+            AddChange::Updated => (palette::upgraded(ui::glyph::change()), Some("(updated)")),
+            AddChange::Kept => (
                 palette::upgraded(ui::glyph::change()),
+                Some("(already in uvr.toml, unchanged)"),
+            ),
+            AddChange::KeptAsRuntime => (
+                palette::upgraded(ui::glyph::change()),
+                Some("(already a runtime dependency, kept in [dependencies])"),
+            ),
+            AddChange::Promoted => (
+                palette::upgraded(ui::glyph::change()),
+                Some("(moved from [dev-dependencies])"),
+            ),
+        };
+        match note {
+            None => println!(
+                "{} {} {}",
+                glyph,
                 palette::pkg(name),
-                palette::version(format_spec(spec)),
-                palette::dim("(updated)"),
-            );
+                palette::version(format_spec(&spec))
+            ),
+            Some(note) => println!(
+                "{} {} {} {}",
+                glyph,
+                palette::pkg(name),
+                palette::version(format_spec(&spec)),
+                palette::dim(note),
+            ),
         }
     }
 
@@ -462,6 +477,94 @@ pub async fn run(
         .context("Failed to install packages after add")?;
 
     Ok(())
+}
+
+/// What `uvr add` did with one package.
+#[derive(Debug, PartialEq, Eq)]
+enum AddChange {
+    Added,
+    Updated,
+    /// A plain `uvr add pkg` for a package already listed from the same
+    /// source: its constraint (and the comment beside it) stays as written.
+    Kept,
+    /// `--dev` for a runtime dependency, which already covers development.
+    KeptAsRuntime,
+    /// A dev dependency added without `--dev` becomes a runtime dependency.
+    Promoted,
+}
+
+/// Where a spec gets the package from. A plain `uvr add pkg` keeps an
+/// existing entry only from the same place: `uvr add pkg --bioc` for a CRAN
+/// entry is a request to switch.
+fn spec_channel(spec: &DependencySpec) -> u8 {
+    if spec.url().is_some() {
+        3
+    } else if spec.git().is_some() {
+        2
+    } else if spec.is_bioc() {
+        1
+    } else {
+        0
+    }
+}
+
+/// True for a spec that names no version, ref or URL: `uvr add pkg` or
+/// `uvr add pkg --bioc`.
+fn is_plain_spec(spec: &DependencySpec) -> bool {
+    match spec {
+        DependencySpec::Version(v) => v.trim() == "*",
+        DependencySpec::Detailed(d) => {
+            d.version.is_none() && d.git.is_none() && d.url.is_none() && d.rev.is_none()
+        }
+    }
+}
+
+/// Add `name` to the manifest, returning what changed and the spec that is
+/// now in `uvr.toml`. A package lives in one section only: one already in
+/// `[dependencies]` stays there under `--dev`, and one in
+/// `[dev-dependencies]` moves to `[dependencies]` without it. A plain spec
+/// does not overwrite an existing constraint from the same source.
+fn apply_add(
+    manifest: &mut uvr_core::manifest::Manifest,
+    name: &str,
+    spec: DependencySpec,
+    dev: bool,
+) -> (AddChange, DependencySpec) {
+    let in_runtime = manifest.dependencies.get(name).cloned();
+    let in_dev = manifest.dev_dependencies.get(name).cloned();
+    let existing = in_runtime.clone().or(in_dev.clone());
+    let keep = existing
+        .as_ref()
+        .filter(|old| is_plain_spec(&spec) && spec_channel(old) == spec_channel(&spec))
+        .cloned();
+    let unchanged = keep.is_some() || existing.as_ref() == Some(&spec);
+    let spec = keep.unwrap_or(spec);
+
+    let change = if in_runtime.is_some() {
+        manifest.dependencies.insert(name.to_string(), spec.clone());
+        match (dev, unchanged) {
+            (true, _) => AddChange::KeptAsRuntime,
+            (false, true) => AddChange::Kept,
+            (false, false) => AddChange::Updated,
+        }
+    } else if in_dev.is_some() && !dev {
+        manifest.dev_dependencies.remove(name);
+        manifest.dependencies.insert(name.to_string(), spec.clone());
+        AddChange::Promoted
+    } else if in_dev.is_some() {
+        manifest
+            .dev_dependencies
+            .insert(name.to_string(), spec.clone());
+        if unchanged {
+            AddChange::Kept
+        } else {
+            AddChange::Updated
+        }
+    } else {
+        manifest.add_dep(name.to_string(), spec.clone(), dev);
+        AddChange::Added
+    };
+    (change, spec)
 }
 
 /// Extract the package name from a `PackageNotFound` anywhere in `err`'s chain,
@@ -826,6 +929,80 @@ fn format_spec(spec: &DependencySpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_with(deps: &[(&str, &str)], dev: &[(&str, &str)]) -> uvr_core::manifest::Manifest {
+        let mut m = uvr_core::manifest::Manifest::new("t", None);
+        for (n, v) in deps {
+            m.add_dep(n.to_string(), DependencySpec::Version(v.to_string()), false);
+        }
+        for (n, v) in dev {
+            m.add_dep(n.to_string(), DependencySpec::Version(v.to_string()), true);
+        }
+        m
+    }
+
+    fn version(v: &str) -> DependencySpec {
+        DependencySpec::Version(v.into())
+    }
+
+    #[test]
+    fn plain_add_keeps_an_existing_constraint() {
+        let mut m = manifest_with(&[("dplyr", ">=1.1.0")], &[]);
+        let (_, spec) = parse_add_spec("dplyr", false).unwrap();
+        let (change, kept) = apply_add(&mut m, "dplyr", spec, false);
+        assert_eq!(change, AddChange::Kept);
+        assert_eq!(kept, version(">=1.1.0"));
+        assert_eq!(m.dependencies["dplyr"], version(">=1.1.0"));
+
+        // A new constraint still replaces it.
+        let (_, spec) = parse_add_spec("dplyr@>=1.2.0", false).unwrap();
+        assert_eq!(
+            apply_add(&mut m, "dplyr", spec, false).0,
+            AddChange::Updated
+        );
+        assert_eq!(m.dependencies["dplyr"], version(">=1.2.0"));
+    }
+
+    #[test]
+    fn plain_add_from_another_source_switches_it() {
+        let mut m = manifest_with(&[("limma", ">=3.0")], &[]);
+        let (_, spec) = parse_add_spec("limma", true).unwrap();
+        let (change, now) = apply_add(&mut m, "limma", spec, false);
+        assert_eq!(change, AddChange::Updated);
+        assert!(now.is_bioc());
+        assert!(m.dependencies["limma"].is_bioc());
+    }
+
+    #[test]
+    fn dev_add_of_a_runtime_dependency_does_not_duplicate_it() {
+        let mut m = manifest_with(&[("dplyr", ">=1.1.0")], &[]);
+        let (_, spec) = parse_add_spec("dplyr", false).unwrap();
+        assert_eq!(
+            apply_add(&mut m, "dplyr", spec, true).0,
+            AddChange::KeptAsRuntime
+        );
+        assert!(!m.dev_dependencies.contains_key("dplyr"));
+        assert_eq!(m.dependencies["dplyr"], version(">=1.1.0"));
+    }
+
+    #[test]
+    fn runtime_add_of_a_dev_dependency_moves_it() {
+        let mut m = manifest_with(&[], &[("testthat", ">=3.0.0")]);
+        let (_, spec) = parse_add_spec("testthat", false).unwrap();
+        let (change, spec) = apply_add(&mut m, "testthat", spec, false);
+        assert_eq!(change, AddChange::Promoted);
+        assert_eq!(spec, version(">=3.0.0"));
+        assert!(!m.dev_dependencies.contains_key("testthat"));
+        assert_eq!(m.dependencies["testthat"], version(">=3.0.0"));
+
+        let mut m = manifest_with(&[], &[("testthat", "*")]);
+        let (_, spec) = parse_add_spec("testthat@>=3.2.0", false).unwrap();
+        assert_eq!(
+            apply_add(&mut m, "testthat", spec, true).0,
+            AddChange::Updated
+        );
+        assert_eq!(m.dev_dependencies["testthat"], version(">=3.2.0"));
+    }
 
     #[test]
     fn parse_cran() {
