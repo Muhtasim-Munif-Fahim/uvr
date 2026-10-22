@@ -26,6 +26,12 @@ pub struct RVersionPin {
     /// Only present when the lockfile includes Bioconductor packages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bioc_version: Option<String>,
+
+    /// The `exclude-newer` date (`YYYY-MM-DD`) CRAN was resolved at, from
+    /// Posit Package Manager's snapshot of that day (#194). `uvr sync`
+    /// takes P3M binaries from the same snapshot. Absent for a live resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_as_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -172,7 +178,20 @@ impl std::fmt::Display for PackageSource {
 impl std::str::FromStr for Lockfile {
     type Err = UvrError;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        toml::from_str(s).map_err(|e| UvrError::LockfileParse(e.to_string()))
+        let lockfile: Lockfile =
+            toml::from_str(s).map_err(|e| UvrError::LockfileParse(e.to_string()))?;
+        // The date goes into P3M URLs and cache file names at sync time, and
+        // a cloned project supplies this file: accept a plain date only.
+        if let Some(date) = &lockfile.r.resolved_as_of {
+            let canonical = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .is_ok_and(|d| d.format("%Y-%m-%d").to_string() == *date);
+            if !canonical {
+                return Err(UvrError::LockfileParse(format!(
+                    "resolved_as_of = {date:?} is not a YYYY-MM-DD date"
+                )));
+            }
+        }
+        Ok(lockfile)
     }
 }
 
@@ -277,6 +296,36 @@ url = "https://bioconductor.org/packages/3.18/bioc/src/contrib/DESeq2_1.42.0.tar
         // Old lockfiles without bioc_version should still parse fine.
         let lf: Lockfile = SAMPLE.parse().expect("parse");
         assert!(lf.r.bioc_version.is_none());
+    }
+
+    #[test]
+    fn lockfile_without_resolved_as_of_round_trips_byte_for_byte() {
+        // #194 regression: a live-resolved lock gains no `resolved_as_of`.
+        let lf: Lockfile = SAMPLE.parse().expect("parse");
+        assert!(lf.r.resolved_as_of.is_none());
+        let canonical = lf.to_toml_string().unwrap();
+        assert!(!canonical.contains("resolved_as_of"));
+        let reparsed: Lockfile = canonical.parse().unwrap();
+        assert_eq!(reparsed.to_toml_string().unwrap(), canonical);
+    }
+
+    #[test]
+    fn resolved_as_of_must_be_a_plain_date() {
+        for bad in ["../../tmp/x", "2024-1-1", "2024-01-01/..", "latest", ""] {
+            let input = format!("[r]\nversion = \"4.5.1\"\nresolved_as_of = {bad:?}\n");
+            let err = input.parse::<Lockfile>().unwrap_err().to_string();
+            assert!(err.contains("YYYY-MM-DD"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn round_trip_with_resolved_as_of() {
+        let input = "[r]\nversion = \"4.5.1\"\nresolved_as_of = \"2024-01-01\"\n\n\
+                     [[package]]\nname = \"glue\"\nversion = \"1.6.2\"\nsource = \"cran\"\n\
+                     url = \"https://packagemanager.posit.co/cran/2024-01-01/src/contrib/glue_1.6.2.tar.gz\"\n";
+        let lf: Lockfile = input.parse().expect("parse");
+        assert_eq!(lf.r.resolved_as_of.as_deref(), Some("2024-01-01"));
+        assert_eq!(lf.to_toml_string().unwrap(), input);
     }
 
     #[test]

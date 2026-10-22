@@ -181,7 +181,7 @@ async fn run() -> Result<()> {
         }
         Commands::Lock(args) => {
             if args.upgrade_package.is_empty() {
-                commands::lock::run(args.upgrade, args.resolution).await?;
+                commands::lock::run(args.upgrade, args.resolution, args.exclude_newer).await?;
             } else {
                 commands::lock::run_upgrade_package(args.upgrade_package, args.resolution).await?;
             }
