@@ -362,12 +362,19 @@ fn extract_zip(zip_path: &Path, library: &Path, package_name: &str) -> Result<()
                 package_name, e
             ))
         })?;
-        let outpath = canonical_staging.join(entry.mangled_name());
+        // zip 9 reports a name it cannot decode as an error.
+        let entry_name = entry.name().map(|n| n.into_owned()).unwrap_or_default();
+        let mangled = entry.mangled_name().map_err(|e| {
+            UvrError::Other(format!(
+                "Unreadable zip entry name in package '{}': {}",
+                package_name, e
+            ))
+        })?;
+        let outpath = canonical_staging.join(mangled);
         if !outpath.starts_with(&canonical_staging) {
             return Err(UvrError::Other(format!(
                 "Zip path traversal detected in package '{}': {}",
-                package_name,
-                entry.name()
+                package_name, entry_name
             )));
         }
         if entry.is_dir() {

@@ -222,7 +222,7 @@ fn extract_from_zip(bytes: &[u8], bin_name: &str) -> Result<Vec<u8>> {
     let mut archive = zip::ZipArchive::new(reader).context("Failed to read zip archive")?;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let name = file.mangled_name();
+        let name = file.mangled_name()?;
         if name.file_name().and_then(|n| n.to_str()) == Some(bin_name) {
             let mut buf = Vec::new();
             file.read_to_end(&mut buf)?;

@@ -1192,7 +1192,11 @@ fn extract_zip_to(archive: &Path, dest: &Path) -> Result<()> {
 
         // Guard against path traversal: reject entries with `..` components
         // or absolute paths that would escape the destination directory.
-        let path = PathBuf::from(entry.name());
+        let name = entry
+            .name()
+            .map_err(|e| UvrError::Other(format!("Unreadable R zip entry name: {e}")))?
+            .into_owned();
+        let path = PathBuf::from(&name);
         if path.is_absolute()
             || path
                 .components()
@@ -1200,7 +1204,7 @@ fn extract_zip_to(archive: &Path, dest: &Path) -> Result<()> {
         {
             return Err(UvrError::Other(format!(
                 "Path traversal detected in R zip: {}",
-                entry.name()
+                name
             )));
         }
 
@@ -1208,7 +1212,7 @@ fn extract_zip_to(archive: &Path, dest: &Path) -> Result<()> {
         if !outpath.starts_with(&canonical_dest) {
             return Err(UvrError::Other(format!(
                 "Path traversal detected in R zip: {}",
-                entry.name()
+                name
             )));
         }
 

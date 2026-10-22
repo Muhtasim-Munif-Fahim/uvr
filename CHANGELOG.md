@@ -7,6 +7,12 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Security updates for dependencies.** rustls 0.23.46, rustls-webpki
+  0.103.16, webpki-roots and webpki-root-certs 1.0.10 (distrusted emSign
+  intermediates), quinn-proto 0.11.18, and zip 9. uvr extracts zip archives
+  entry by entry with its own path checks, so the zip advisories (which
+  concern `ZipArchive::extract`) did not reach it.
+
 - **Override or constrain a dependency's version from `uvr.toml`** (#195).
   `[override-dependencies]` sets a package to an exact version and ignores
   what other packages (and `[dependencies]`) require of it; `uvr lock -v`
