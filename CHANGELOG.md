@@ -7,6 +7,15 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Override or constrain a dependency's version from `uvr.toml`** (#195).
+  `[override-dependencies]` sets a package to an exact version and ignores
+  what other packages (and `[dependencies]`) require of it; `uvr lock -v`
+  shows each requirement that an override ignores. `[constraint-dependencies]`
+  adds a version range that a package must satisfy if something pulls it in,
+  without adding it to the project. An override can select an archived CRAN
+  release. An exact version requirement (`== 1.0.8`) no longer matches a
+  four-part release such as 1.0.8.3.
+
 - **Resolve CRAN as of a date, to reproduce an old analysis** (#194).
   `uvr lock --exclude-newer 2024-01-01`, or `[resolution] exclude-newer` in
   `uvr.toml`, resolves CRAN packages from the Posit Package Manager snapshot
