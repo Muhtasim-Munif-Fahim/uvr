@@ -565,6 +565,13 @@ export UVR_REPO_PASSWORD_INTERNAL_PPM=...
 
 - `<NAME>` is the source `name` with any `:port` suffix removed, in upper case, and with each character that is not a letter or digit changed to `_` (`internal-ppm` → `INTERNAL_PPM`). For `uvr add --source <url>` and `UVR_REPOS`, the name is the URL host (`ppm.corp.example:8443` → `PPM_CORP_EXAMPLE`).
 - If the token is set, uvr uses it and ignores the user and password. uvr removes spaces at the start and end of each value. An empty value counts as not set.
+- **Pin the host.** The variables are keyed by the repository name, and a project you clone chooses its own names and URLs. Set `UVR_REPO_HOST_<NAME>` to the repository's host, and uvr sends the variables only to URLs on that host:
+
+  ```sh
+  export UVR_REPO_HOST_INTERNAL_PPM=ppm.corp.example   # or ppm.corp.example:8443 to pin the port too
+  ```
+
+  A `uvr.toml` that points `internal-ppm` at another host then gets nothing from these variables, and uvr warns. Without the pin, any project that uses the name `internal-ppm` gets the credential. `~/.netrc` entries are keyed by host already.
 - uvr sends the credential with the index (`PACKAGES.gz`) request and with each package download, but only to URLs under the source `url`. When a redirect goes to a different host or port, uvr does not send it. uvr never shows it in output (`-v` included), and does not pass it to `R CMD INSTALL`.
 - If none of these variables is set, uvr uses the `~/.netrc` entry for the repository host, with HTTP basic auth:
 

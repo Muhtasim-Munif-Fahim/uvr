@@ -20,6 +20,7 @@ use crate::lockfile::PackageSource;
 const TOKEN_PREFIX: &str = "UVR_REPO_TOKEN_";
 const USER_PREFIX: &str = "UVR_REPO_USER_";
 const PASSWORD_PREFIX: &str = "UVR_REPO_PASSWORD_";
+const HOST_PREFIX: &str = "UVR_REPO_HOST_";
 const GIT_TOKEN_PREFIX: &str = "UVR_GIT_TOKEN_";
 const GIT_USER_PREFIX: &str = "UVR_GIT_USER_";
 const GITLAB_TOKEN_PREFIX: &str = "UVR_GITLAB_TOKEN_";
@@ -169,11 +170,18 @@ fn read_var(prefix: &str, key: &str) -> Option<String> {
 ///
 /// `<NAME>` is [`env_key`]. Values are trimmed; empty or whitespace-only
 /// values count as unset.
+///
+/// The repository name comes from `uvr.toml`, which a cloned project
+/// controls, so `UVR_REPO_HOST_<NAME>` can bind the variables to a host:
+/// when it is set, they go only to a URL on that host (and port, if the
+/// value names one), and any other URL falls through to netrc.
 pub fn resolve(name: &str, url: &str) -> Option<Credential> {
     if has_userinfo(url) {
         return None;
     }
-    let credential = env_credential(&env_key(name)).or_else(|| {
+    let key = env_key(name);
+    let env = env_credential(&key).filter(|_| host_pin_allows(name, &key, url));
+    let credential = env.or_else(|| {
         let entry = netrc_entry(&url_host(url)?)?;
         Some(Credential::Basic {
             username: entry.login,
@@ -189,6 +197,40 @@ pub fn resolve(name: &str, url: &str) -> Option<Credential> {
         return None;
     }
     Some(credential)
+}
+
+/// Whether `UVR_REPO_HOST_<NAME>`, when set, names the host of `url`. A
+/// value without a port matches any port. On a mismatch, warn once: the
+/// variables are being withheld from a URL the user did not name.
+fn host_pin_allows(name: &str, key: &str, url: &str) -> bool {
+    let Some(pin) = read_var(HOST_PREFIX, key) else {
+        return true;
+    };
+    let Some(parsed) = reqwest::Url::parse(url).ok() else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or_default();
+    let port = parsed.port_or_known_default();
+    // `host`, `host:port`, or a pasted URL (its scheme and path dropped).
+    let authority = pin.split_once("://").map_or(pin.as_str(), |(_, rest)| rest);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    let (pin_host, pin_port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !h.contains(']') || h.ends_with(']') => match p.parse::<u16>() {
+            Ok(p) => (h, Some(p)),
+            Err(_) => (authority, None),
+        },
+        _ => (authority, None),
+    };
+    let ok = pin_host.eq_ignore_ascii_case(host) && pin_port.is_none_or(|p| Some(p) == port);
+    if !ok {
+        warn_once(format!(
+            "Not sending UVR_REPO_* credentials for repository `{name}` to {}: \
+             {HOST_PREFIX}{key} names {pin}. If uvr.toml changed this repository's URL \
+             on purpose, update {HOST_PREFIX}{key}.",
+            redact_url(url)
+        ));
+    }
+    ok
 }
 
 /// Whether a credential may go to `url`: https, or plain http to a loopback
@@ -906,10 +948,15 @@ impl Repository {
                  or add a `machine {host}` entry to {netrc}."
             ),
             // A basic credential that the environment did not give came from netrc.
-            Some(Credential::Basic { .. }) if env_credential(&key).is_none() => format!(
-                "it refused the login and password of the `machine {host}` entry in {netrc}. \
-                 Check that they are valid, or set UVR_REPO_TOKEN_{key}, which has precedence."
-            ),
+            Some(Credential::Basic { .. })
+                if env_credential(&key).is_none()
+                    || !host_pin_allows(&self.name, &key, &self.url) =>
+            {
+                format!(
+                    "it refused the login and password of the `machine {host}` entry in {netrc}. \
+                     Check that they are valid, or set UVR_REPO_TOKEN_{key}, which has precedence."
+                )
+            }
             Some(Credential::Bearer(_)) => format!(
                 "it refused the token in UVR_REPO_TOKEN_{key}. Check that the token is valid \
                  and gives access to this repository."
@@ -1150,6 +1197,80 @@ mod tests {
                 password: "s3cret".into()
             })
         );
+        clear();
+    }
+
+    #[test]
+    fn repo_host_pin_keeps_env_credentials_on_the_named_host() {
+        let _env = crate::env_vars::env_lock();
+        clear();
+        let tmp = tempfile::tempdir().unwrap();
+        let netrc = tmp.path().join("netrc");
+        std::env::set_var("NETRC", &netrc);
+        std::env::set_var("UVR_REPO_TOKEN_INTERNAL_PPM", "tok");
+        let bearer = Some(Credential::Bearer("tok".into()));
+
+        // Unpinned: the name alone decides, as before.
+        assert_eq!(resolve("internal-ppm", "https://evil.example/cran"), bearer);
+
+        std::env::set_var("UVR_REPO_HOST_INTERNAL_PPM", "PPM.corp.example");
+        assert_eq!(
+            resolve("internal-ppm", "https://ppm.corp.example/cran"),
+            bearer
+        );
+        assert_eq!(
+            resolve("internal-ppm", "https://ppm.corp.example:8443/cran"),
+            bearer,
+            "a pin without a port matches any port"
+        );
+        // A cloned uvr.toml pointing the trusted name elsewhere gets nothing.
+        assert_eq!(resolve("internal-ppm", "https://evil.example/cran"), None);
+        assert_eq!(
+            resolve("internal-ppm", "https://ppm.corp.example.evil.example/cran"),
+            None
+        );
+
+        std::env::set_var("UVR_REPO_HOST_INTERNAL_PPM", "ppm.corp.example:8443");
+        assert_eq!(
+            resolve("internal-ppm", "https://ppm.corp.example:8443/cran"),
+            bearer
+        );
+        assert_eq!(
+            resolve("internal-ppm", "https://ppm.corp.example/cran"),
+            None
+        );
+
+        std::env::set_var(
+            "UVR_REPO_HOST_INTERNAL_PPM",
+            "https://ppm.corp.example/cran/",
+        );
+        assert_eq!(
+            resolve("internal-ppm", "https://ppm.corp.example/cran"),
+            bearer,
+            "a pasted URL pins its host"
+        );
+
+        // A withheld variable falls through to the netrc entry, which is
+        // keyed by the URL's own host and so cannot be redirected.
+        // (A new path: netrc is cached per path, and must be private.)
+        let netrc = tmp.path().join("netrc2");
+        std::fs::write(&netrc, "machine evil.example login a password b\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&netrc, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::env::set_var("NETRC", &netrc);
+        assert_eq!(
+            resolve("internal-ppm", "https://evil.example/cran"),
+            Some(Credential::Basic {
+                username: "a".into(),
+                password: "b".into()
+            })
+        );
+
+        std::env::remove_var("UVR_REPO_HOST_INTERNAL_PPM");
+        std::env::remove_var("NETRC");
         clear();
     }
 

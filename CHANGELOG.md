@@ -7,6 +7,34 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **`UVR_REPO_HOST_<NAME>` binds a repository's credentials to its host.**
+  `UVR_REPO_TOKEN_<NAME>` and `UVR_REPO_USER/PASSWORD_<NAME>` are keyed by the
+  `[[sources]]` name, which a cloned `uvr.toml` chooses, so a project could
+  name your repository and point it at its own URL. With
+  `UVR_REPO_HOST_INTERNAL_PPM=ppm.corp.example` set, the variables go only to
+  that host (and port, if given); any other URL gets a warning and falls
+  through to `~/.netrc`. Without the pin nothing changes.
+
+- **`--unattended` no longer leaves `.uvr/` untracked.** `.uvr/` now holds a
+  `.gitignore` with `*`, so the library uvr creates stays out of `git status`
+  without editing the project's own `.gitignore`. `uvr activate` under
+  `--unattended` no longer writes the activation shims (and their
+  `.gitignore` entry); it prints `eval "$(uvr activate --emit sh)"` instead.
+
+- **`uvr add pkg` keeps an existing constraint.** Adding a package that
+  `uvr.toml` already lists, without a version, used to reset its constraint
+  to `*`. It now stays as written (with its comment), unless the add switches
+  the source (`--bioc`, a git spec, a URL). `uvr add --dev` for a runtime
+  dependency no longer lists it in both sections, and `uvr add` without
+  `--dev` moves a dev dependency to `[dependencies]`.
+
+- **`uvr scan` ignores `box::use(...)` inside strings**, and a `#` inside a
+  string no longer hides a `box::use` later on the same line.
+
+- **The OpenMP site profiles are replaced atomically**, so an R session
+  started by a concurrent `uvr run` never reads a half-written profile, and
+  a rewritten `Rprofile.site` keeps its file mode.
+
 - **`uvr lock` gets the base packages from the active R** (#169). The resolver
   adds the names that `installed.packages(priority = "base")` gives to its
   hardcoded list. Thus a base package that a new R release adds is not sent
