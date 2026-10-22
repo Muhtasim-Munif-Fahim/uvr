@@ -2603,6 +2603,45 @@ fn test_init_unattended_writes_only_manifest_and_library() {
 }
 
 #[test]
+fn test_unattended_leaves_git_status_clean_except_for_the_manifest() {
+    let dir = TempDir::new().unwrap();
+    let git_status = || {
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(init.success());
+
+    uvr_cmd()
+        .args(["init", "--here", "cleanproj", "--unattended"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    // The library sits in `.uvr/`, which ignores itself: no root
+    // `.gitignore` edit is needed to keep it out of `git status`.
+    assert_eq!(git_status(), "?? uvr.toml\n");
+
+    // `uvr activate` normally backfills the shims (and a `.gitignore`
+    // entry). Unattended, it points at `--emit` instead.
+    uvr_cmd()
+        .args(["activate", "--unattended"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--emit sh"));
+    assert!(!dir.path().join(".uvr").join("activate").exists());
+    assert_eq!(git_status(), "?? uvr.toml\n");
+}
+
+#[test]
 fn test_init_unattended_before_subcommand_still_beats_explicit_ide() {
     // The removed `conflicts_with = "unattended"` only fired when the global
     // flag followed the subcommand, so `uvr --unattended init --ide positron`

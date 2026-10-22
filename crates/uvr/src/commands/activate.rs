@@ -82,6 +82,14 @@ pub fn run(emit: Option<ActivateShell>, write_shim: bool) -> Result<()> {
     // hostile — the user would get a wall of exports printed to the terminal.
     let project = find_project()?;
     if shims_incomplete(&project.root) {
+        // `--unattended` writes nothing into the working tree, and the shims
+        // come with a `.gitignore` edit. Activate without a file instead.
+        if uvr_core::env_vars::unattended() {
+            ui::info("Activate this project in your shell:");
+            ui::bullet("eval \"$(uvr activate --emit sh)\"");
+            ui::hint("Use `--emit fish` or `--emit powershell` for those shells.");
+            return Ok(());
+        }
         write_shims(&project.root)?;
     }
     // `ui::info` renders a one-line headline; the command and the follow-up go

@@ -221,6 +221,7 @@ pub async fn run(
     // Create .uvr/library/
     let library_path = cwd.join(DOT_UVR_DIR).join(LIBRARY_DIR);
     std::fs::create_dir_all(&library_path).context("Failed to create .uvr/library/")?;
+    uvr_core::project::ensure_dot_uvr_ignored(&cwd).context("Failed to write .uvr/.gitignore")?;
 
     // Mirror the scaffolding `uvr init` writes — without these, a user
     // migrating from renv ends up with `uvr.toml` but no `.Rprofile`

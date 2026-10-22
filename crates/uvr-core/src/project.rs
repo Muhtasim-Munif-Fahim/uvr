@@ -11,6 +11,24 @@ pub const R_VERSION_FILE: &str = ".r-version";
 pub const DOT_UVR_DIR: &str = ".uvr";
 pub const LIBRARY_DIR: &str = "library";
 
+/// Contents of `.uvr/.gitignore`. `*` also matches the file itself.
+const DOT_UVR_GITIGNORE: &str = "# Written by uvr: everything in .uvr/ is generated.\n*\n";
+
+/// Make `<root>/.uvr/` ignore itself with a `.gitignore` inside it, when the
+/// directory exists. The root `.gitignore` entries cover a normal project,
+/// but `--unattended` must not touch tracked files, and without this its
+/// library left `.uvr/` untracked in a CI checkout. The file sits in a
+/// directory uvr owns, so writing it changes nothing git tracks. An
+/// existing file is left alone.
+pub fn ensure_dot_uvr_ignored(root: &Path) -> std::io::Result<()> {
+    let dir = root.join(DOT_UVR_DIR);
+    let path = dir.join(".gitignore");
+    if !dir.is_dir() || path.exists() {
+        return Ok(());
+    }
+    std::fs::write(path, DOT_UVR_GITIGNORE)
+}
+
 /// Whether this project's manifest came from `uvr.toml` or a `DESCRIPTION` file.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ManifestSource {
@@ -117,6 +135,7 @@ impl Project {
     /// Ensure `.uvr/library/` exists.
     pub fn ensure_library_dir(&self) -> Result<()> {
         std::fs::create_dir_all(self.library_path())?;
+        ensure_dot_uvr_ignored(&self.root)?;
         Ok(())
     }
 
@@ -242,6 +261,21 @@ mod tests {
         assert!(!project.library_path().exists());
         project.ensure_library_dir().unwrap();
         assert!(project.library_path().exists());
+        let ignore = dir.path().join(".uvr").join(".gitignore");
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), DOT_UVR_GITIGNORE);
+    }
+
+    #[test]
+    fn dot_uvr_gitignore_is_written_once_and_only_into_an_existing_dir() {
+        let dir = TempDir::new().unwrap();
+        ensure_dot_uvr_ignored(dir.path()).unwrap();
+        assert!(!dir.path().join(".uvr").exists());
+
+        let ignore = dir.path().join(".uvr").join(".gitignore");
+        std::fs::create_dir(dir.path().join(".uvr")).unwrap();
+        std::fs::write(&ignore, "library/\n").unwrap();
+        ensure_dot_uvr_ignored(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "library/\n");
     }
 
     #[test]

@@ -81,6 +81,7 @@ pub fn run(
     // Create .uvr/library/
     let library_path = cwd.join(DOT_UVR_DIR).join(LIBRARY_DIR);
     std::fs::create_dir_all(&library_path).context("Failed to create .uvr/library/")?;
+    uvr_core::project::ensure_dot_uvr_ignored(&cwd).context("Failed to write .uvr/.gitignore")?;
 
     // Project scaffolding. In `--unattended` / `UVR_UNATTENDED=1` mode uvr
     // must not modify the checked-out tree, so nothing is written beyond
