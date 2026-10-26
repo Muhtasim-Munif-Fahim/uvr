@@ -248,8 +248,9 @@ pub fn lookup(name: &str, key: &str) -> Option<PathBuf> {
 /// uvr-installed (#255).
 ///
 /// Entries stored since #255 already carry the marker, which the attach
-/// reproduces. An older entry gets it here: in the cache entry itself when
-/// the library holds a symlink to it, otherwise as a library-local file.
+/// reproduces. An older entry gets it here as a library-local file (the
+/// attached tree has its own `Meta/` directory, so the shared cache entry is
+/// not touched).
 pub fn clone_to_library(
     cached_pkg_dir: &Path,
     library: &Path,

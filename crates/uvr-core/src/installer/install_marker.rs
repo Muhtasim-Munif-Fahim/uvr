@@ -8,9 +8,9 @@
 //! apart from its own files. A reinstall by R replaces the whole package
 //! directory, so a package the user reinstalls by hand loses the marker.
 //!
-//! A library entry can be a symlink into the shared package cache (the
-//! Linux attach), so the marker may be written into a cache entry that other
-//! projects use too. That is correct, because only uvr creates cache entries, and it is
+//! A library entry can still be a symlink into the shared package cache (a
+//! library written by uvr before #248 on Linux), so the marker may be written
+//! into a cache entry that other projects use too. That is correct, because only uvr creates cache entries, and it is
 //! why the content does not depend on the project and why an existing marker
 //! is never rewritten.
 
