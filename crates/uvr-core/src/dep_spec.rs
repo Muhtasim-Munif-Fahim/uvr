@@ -64,6 +64,16 @@ fn url_name_hint(url: &str) -> String {
 pub fn parse(raw: &str, bioc: bool) -> Result<(String, DependencySpec)> {
     let raw = raw.trim();
 
+    // `uvr add` handles local directories before it gets here. A script
+    // header has no project root to resolve one against, and a path would
+    // not be portable between machines anyway.
+    if raw.starts_with(['.', '/']) {
+        return Err(invalid(format!(
+            "'{raw}': local package directories are not supported here; add one to a \
+             project with `uvr add {raw}`"
+        )));
+    }
+
     // A git source has no channel to pick, so a `(bioc)` suffix on one is
     // refused rather than silently dropped. (`--bioc` still passes over git
     // specs: it applies to a whole `uvr add` batch, which may mix kinds.)

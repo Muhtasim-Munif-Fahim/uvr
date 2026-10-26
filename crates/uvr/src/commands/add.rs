@@ -289,7 +289,9 @@ enum AddChange {
 /// existing entry only from the same place: `uvr add pkg --bioc` for a CRAN
 /// entry is a request to switch.
 fn spec_channel(spec: &DependencySpec) -> u8 {
-    if spec.url().is_some() {
+    if spec.path().is_some() {
+        4
+    } else if spec.url().is_some() {
         3
     } else if spec.git().is_some() {
         2
@@ -306,7 +308,11 @@ fn is_plain_spec(spec: &DependencySpec) -> bool {
     match spec {
         DependencySpec::Version(v) => v.trim() == "*",
         DependencySpec::Detailed(d) => {
-            d.version.is_none() && d.git.is_none() && d.url.is_none() && d.rev.is_none()
+            d.version.is_none()
+                && d.git.is_none()
+                && d.url.is_none()
+                && d.path.is_none()
+                && d.rev.is_none()
         }
     }
 }

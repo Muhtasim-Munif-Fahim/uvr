@@ -82,7 +82,12 @@ async fn lock_and_write(
             // Reuse the whole resolution only when its inputs still match.
             // Individual pins lose dependency constraints in legacy locks and
             // can belong to a different R/Bioconductor release.
-            if super::sync::validate_frozen_lock(project, &locked).is_ok() {
+            // A path package's DESCRIPTION can change without uvr.toml
+            // changing, so a lock holding one is always re-read.
+            let has_local = locked.packages.iter().any(|p| {
+                matches!(p.source, uvr_core::lockfile::PackageSource::Local { .. })
+            });
+            if !has_local && super::sync::validate_frozen_lock(project, &locked).is_ok() {
                 locked.manifest_fingerprint = Some(project.manifest.lock_fingerprint()?);
                 project
                     .save_lockfile(&locked)
@@ -316,7 +321,12 @@ async fn resolve_lockfile(
 
     // Pins override even git-resolved entries: a non-targeted git package
     // must stay at its locked commit, not drift to a fresh HEAD (#127).
-    pre_resolved.extend(pins);
+    // Path packages are the exception: their locked entry is a snapshot of a
+    // directory that may have changed, so the fresh read seeded above wins.
+    pre_resolved.extend(
+        pins.into_iter()
+            .filter(|(_, p)| !matches!(p.source, uvr_core::lockfile::PackageSource::Local { .. })),
+    );
 
     // Build the registry chain: custom sources → Bioconductor → CRAN.
     // Custom repos come first so user-configured sources take priority.
