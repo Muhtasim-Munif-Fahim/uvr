@@ -7,6 +7,11 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 Pure tracking section — fixes and small features land here between tags.
 
+- **Linux: `uvr r install` points the wrapper's first `R_HOME_DIR` at
+  `lib/R`** (#271). The v0.4.7 rewrite used the install root, which is
+  R_HOME on macOS but not on Linux, so Positron still failed to start a
+  uvr-managed R there.
+
 ## v0.4.8 (2026-10-22)
 
 Scripts become self-contained: a `# /// script` header can pin versions,

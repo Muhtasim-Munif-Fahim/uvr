@@ -1105,7 +1105,13 @@ fn patch_wrapper_r_home_dir(r_home: &Path, dest: &Path) {
     let Ok(content) = std::fs::read_to_string(&wrapper) else {
         return;
     };
-    let dest = dest.display().to_string();
+    // Linux builds keep R_HOME in `lib/R`; macOS builds keep it at the root.
+    let home = if r_home.join("lib").join("R").is_dir() {
+        dest.join("lib").join("R")
+    } else {
+        dest.to_path_buf()
+    };
+    let dest = home.display().to_string();
     // Quote iff needed: the assignment is a live shell statement, so an
     // unquoted path with whitespace would break execution, but the upstream
     // wrapper (and the common case) is unquoted and some static readers may
@@ -1670,6 +1676,34 @@ R_HOME_DIR=\"$(cd \"$(dirname \"$0\")/..\" && pwd)\"\n";
                 .mode();
             assert_eq!(mode & 0o111, 0o111, "wrapper must stay executable");
         }
+    }
+
+    #[test]
+    fn install_r_portable_points_linux_wrapper_at_lib_r() {
+        // The Linux portable builds keep R_HOME in `lib/R`, which is what the
+        // wrapper's own runtime override resolves to.
+        let wrapper = b"#!/bin/sh\n\
+# Shell wrapper for R executable.\n\
+\n\
+R_HOME_DIR=/opt/R/4.5.3/lib/R\n";
+        let archive = write_tar_gz(&[
+            ("4.5.3/bin/R", wrapper, 0o755),
+            (
+                "4.5.3/lib/R/library/base/DESCRIPTION",
+                b"Package: base\n",
+                0o644,
+            ),
+        ]);
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest = dest_dir.path().join("4.5.3");
+        install_r_portable(archive.path(), &dest, Platform::LinuxX86_64).unwrap();
+
+        let patched = std::fs::read_to_string(dest.join("bin").join("R")).unwrap();
+        assert_eq!(
+            patched.lines().nth(3).unwrap(),
+            format!("R_HOME_DIR={}", dest.join("lib").join("R").display())
+        );
     }
 
     #[test]
