@@ -248,6 +248,51 @@ pub async fn run(
     .await
 }
 
+/// Local (path) packages whose directory no longer matches uvr.lock: a new
+/// DESCRIPTION version, or a dependency the lock does not hold. The lock is a
+/// snapshot of a directory the user keeps editing, and installing an edited
+/// package against the old resolution fails on its first new import.
+///
+/// A dependency the active R ships (a recommended package such as Matrix) is
+/// left out of the lock on purpose, so it does not count as new; R is only
+/// asked for that list when some dependency is missing from the lock.
+fn changed_local_packages(
+    project: &Project,
+    lockfile: &Lockfile,
+    r_binary: Option<&std::path::Path>,
+) -> Vec<String> {
+    let locked: std::collections::HashSet<&str> =
+        lockfile.packages.iter().map(|p| p.name.as_str()).collect();
+    let mut r_ships: Option<Vec<String>> = None;
+    let mut changed = Vec::new();
+    for pkg in &lockfile.packages {
+        let uvr_core::lockfile::PackageSource::Local { path } = &pkg.source else {
+            continue;
+        };
+        // An unreadable directory is the install's to report.
+        let Ok((info, _, _)) =
+            uvr_core::registry::local::resolve_local_package(&project.root, path)
+        else {
+            continue;
+        };
+        let mut new_deps = info.requires.iter().filter(|d| {
+            !uvr_core::resolver::is_base_package(&d.name) && !locked.contains(d.name.as_str())
+        });
+        let has_new_dep = new_deps.any(|d| {
+            let ships = r_ships.get_or_insert_with(|| {
+                r_binary
+                    .and_then(uvr_core::r_version::detector::query_r_base_packages)
+                    .unwrap_or_default()
+            });
+            !ships.iter().any(|b| b == &d.name)
+        });
+        if has_new_dep || info.version.to_string() != pkg.version {
+            changed.push(pkg.name.clone());
+        }
+    }
+    changed
+}
+
 /// Install all packages from the existing lockfile.
 ///
 /// Does NOT re-resolve — the lockfile is the source of truth.
@@ -359,7 +404,21 @@ pub async fn run_inner(
                     .await
                     .context("Failed to re-resolve uvr.lock for the new R version")?
             }
-            _ => lockfile,
+            _ => {
+                let r_bin = r_info.as_ref().map(|(bin, _)| bin.as_path());
+                let changed = changed_local_packages(project, &lockfile, r_bin);
+                if changed.is_empty() {
+                    lockfile
+                } else {
+                    ui::info(format!(
+                        "Local package {} changed since uvr.lock was written; re-resolving",
+                        changed.join(", ")
+                    ));
+                    crate::commands::lock::resolve_and_lock(project, false)
+                        .await
+                        .context("Failed to re-resolve uvr.lock for a changed local package")?
+                }
+            }
         }
     } else {
         lockfile
@@ -3609,6 +3668,63 @@ mod tests {
             cache.join("DESCRIPTION").exists(),
             "pruning a symlinked entry must never traverse into the cache"
         );
+    }
+
+    #[test]
+    fn a_changed_local_package_is_noticed_and_an_unchanged_one_is_not() {
+        // #188: sync re-resolves when a path package's DESCRIPTION moved past
+        // the lock, instead of installing it against the old resolution.
+        let temp = tempfile::TempDir::new().unwrap();
+        uvr_core::manifest::Manifest::new("proj", None)
+            .write(&temp.path().join("uvr.toml"))
+            .unwrap();
+        let project = Project::find(temp.path()).unwrap();
+        let pkg_dir = temp.path().join("mypkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let describe = |extra: &str| {
+            std::fs::write(
+                pkg_dir.join("DESCRIPTION"),
+                format!("Package: mypkg\nVersion: 0.1.0\n{extra}"),
+            )
+            .unwrap();
+        };
+        let mut local = locked_pkg("mypkg", "0.1.0", "");
+        local.source = PackageSource::Local {
+            path: "mypkg".into(),
+        };
+        local.url = None;
+        local.requires = vec!["rlang".into()];
+        let lock = Lockfile {
+            manifest_fingerprint: None,
+            r: RVersionPin {
+                version: "4.5.0".into(),
+                bioc_version: None,
+                resolved_as_of: None,
+            },
+            packages: vec![
+                local,
+                locked_pkg("rlang", "1.1.6", "https://cran.example/rlang.tar.gz"),
+            ],
+        };
+        let changed = || changed_local_packages(&project, &lock, None);
+
+        // Base packages and R itself never count; a locked dependency is fine.
+        describe("Depends: R (>= 4.1), methods\nImports: rlang\n");
+        assert!(changed().is_empty());
+
+        describe("Imports: rlang, glue\n");
+        assert_eq!(changed(), vec!["mypkg".to_string()]);
+
+        std::fs::write(
+            pkg_dir.join("DESCRIPTION"),
+            "Package: mypkg\nVersion: 0.2.0\nImports: rlang\n",
+        )
+        .unwrap();
+        assert_eq!(changed(), vec!["mypkg".to_string()]);
+
+        // A directory that is gone is the install's to report.
+        std::fs::remove_dir_all(&pkg_dir).unwrap();
+        assert!(changed().is_empty());
     }
 
     fn locked_pkg(name: &str, version: &str, url: &str) -> LockedPackage {

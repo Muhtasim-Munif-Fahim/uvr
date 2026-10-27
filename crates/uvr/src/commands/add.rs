@@ -948,6 +948,25 @@ mod tests {
     }
 
     #[test]
+    fn a_path_add_switches_a_registry_entry_and_back() {
+        // #188: a path is its own source. Treating it as a plain spec kept the
+        // registry entry and reported "unchanged".
+        let mut m = manifest_with(&[("mypkg", "*")], &[]);
+        let (_, spec) = parse_add_spec("../mypkg", false).unwrap();
+        let (change, now) = apply_add(&mut m, "mypkg", spec, false);
+        assert_eq!(change, AddChange::Updated);
+        assert_eq!(now.path(), Some("../mypkg"));
+        assert_eq!(m.dependencies["mypkg"].path(), Some("../mypkg"));
+
+        let (_, spec) = parse_add_spec("mypkg", false).unwrap();
+        assert_eq!(
+            apply_add(&mut m, "mypkg", spec, false).0,
+            AddChange::Updated
+        );
+        assert_eq!(m.dependencies["mypkg"].path(), None);
+    }
+
+    #[test]
     fn parse_cran() {
         let (name, spec) = parse_add_spec("ggplot2@>=3.0.0", false).unwrap();
         assert_eq!(name, "ggplot2");

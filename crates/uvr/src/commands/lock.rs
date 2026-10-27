@@ -84,9 +84,10 @@ async fn lock_and_write(
             // can belong to a different R/Bioconductor release.
             // A path package's DESCRIPTION can change without uvr.toml
             // changing, so a lock holding one is always re-read.
-            let has_local = locked.packages.iter().any(|p| {
-                matches!(p.source, uvr_core::lockfile::PackageSource::Local { .. })
-            });
+            let has_local = locked
+                .packages
+                .iter()
+                .any(|p| matches!(p.source, uvr_core::lockfile::PackageSource::Local { .. }));
             if !has_local && super::sync::validate_frozen_lock(project, &locked).is_ok() {
                 locked.manifest_fingerprint = Some(project.manifest.lock_fingerprint()?);
                 project

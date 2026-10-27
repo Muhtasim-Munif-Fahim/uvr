@@ -403,6 +403,16 @@ mod tests {
     }
 
     #[test]
+    fn a_local_directory_is_refused_with_the_uvr_add_hint() {
+        // #188: paths are `uvr add` only; a header has no root to anchor one.
+        for raw in ["../mypkg", "./mypkg", "/srv/mypkg"] {
+            let err = parse(raw, false).unwrap_err().to_string();
+            assert!(err.contains("local package directories"), "{raw}: {err}");
+            assert!(err.contains(&format!("uvr add {raw}")), "{raw}: {err}");
+        }
+    }
+
+    #[test]
     fn a_bad_constraint_is_refused_up_front_naming_the_spec() {
         let err = parse("ggplot2>>3", false).unwrap_err().to_string();
         assert!(err.contains("Invalid version constraint"), "{err}");
