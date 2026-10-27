@@ -1501,7 +1501,13 @@ mod tests {
             system_requirements: None,
             bioc: false,
         }];
-        apply_index(&mut out, &packages, Some(&index), "ubuntu-22.04");
+        apply_index(
+            &mut out,
+            &packages,
+            Some(&index),
+            "ubuntu-22.04",
+            &crate::sysreqs_overrides::Overrides::default(),
+        );
 
         let deps = out.resolved.get("xml2").expect("xml2 must be recorded");
         assert_eq!(deps.len(), 1);
@@ -1519,7 +1525,13 @@ mod tests {
             system_requirements: Some("libcurl".to_string()),
             bioc: false,
         }];
-        apply_index(&mut out, &packages, None, "ubuntu-22.04");
+        apply_index(
+            &mut out,
+            &packages,
+            None,
+            "ubuntu-22.04",
+            &crate::sysreqs_overrides::Overrides::default(),
+        );
 
         assert_eq!(out.local_resolved, 1, "the local rules must have matched");
         assert!(
