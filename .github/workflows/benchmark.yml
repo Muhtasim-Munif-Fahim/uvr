@@ -134,7 +134,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ github.ref_name }}-${{ github.run_number }}
+          # A PR's ref_name is `<n>/merge`, and artifact names can't hold a `/`.
+          name: bench-${{ github.event_name == 'pull_request' && format('pr{0}', github.event.number) || github.ref_name }}-${{ github.run_number }}
           path: |
             benchmarks/out/bench-results.json
             benchmarks/out/bench.log
