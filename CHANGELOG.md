@@ -10,7 +10,15 @@ Pure tracking section — fixes and small features land here between tags.
 - **Linux: `uvr r install` points the wrapper's first `R_HOME_DIR` at
   `lib/R`** (#271). The v0.4.7 rewrite used the install root, which is
   R_HOME on macOS but not on Linux, so Positron still failed to start a
-  uvr-managed R there.
+  uvr-managed R there. Applies to new installs; refresh an existing version
+  with `uvr r uninstall <ver> && uvr r install <ver>`. Thanks @SAY-5.
+- **`UVR_USER_ENVIRON=1` restores the user's `~/.Renviron` inside `uvr run`
+  and `uvr activate`** (#260). uvr blanks `R_ENVIRON_USER` so a `~/.Renviron`
+  setting `R_LIBS_USER` cannot silently override the project library, but that
+  defence is aimed at one variable and costs the whole file — API tokens,
+  `GITHUB_PAT`, proxy settings, TZ and locale went with it, while
+  `R CMD INSTALL` kept them. The opt-out is off by default and leaves the
+  *site* Renviron blanked either way.
 
 ## v0.4.8 (2026-10-22)
 
@@ -428,13 +436,6 @@ Two changes may need action:
   `uvr r uninstall <ver> && uvr r install <ver>`. Reported with a
   verified one-line diagnosis by @Felixmil.
 
-- **`UVR_USER_ENVIRON=1` restores the user's `~/.Renviron` inside `uvr run`
-  and `uvr activate`** (#260). uvr blanks `R_ENVIRON_USER` so a `~/.Renviron`
-  setting `R_LIBS_USER` cannot silently override the project library, but that
-  defence is aimed at one variable and costs the whole file — API tokens,
-  `GITHUB_PAT`, proxy settings, TZ and locale went with it, while
-  `R CMD INSTALL` kept them. The opt-out is off by default and leaves the
-  *site* Renviron blanked either way.
 - **GitHub dependencies can select an R package in a repository
   subdirectory, directly or through transitive DESCRIPTION `Remotes:`** (#244).
   Direct declarations use
