@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{Context, Result};
 
@@ -13,9 +13,34 @@ use uvr_core::resolver::is_base_package;
 use crate::ui;
 use crate::ui::palette;
 
-/// Parse one `uvr add` argument — the grammar lives in
-/// [`uvr_core::dep_spec`], shared with script headers.
+/// Explicit path syntax only: `./x`, `../x`, `/abs/x`, `C:\x`. A bare `name`
+/// or `owner/repo` stays a registry or GitHub spec even when a directory of
+/// that name exists, so an existing command never changes what it installs.
+/// `~` is not expanded here; the shell does that.
+///
+/// Deliberately not part of `uvr_core::dep_spec`: a path is relative to the
+/// invoking cwd on `uvr add`, but a script header has no such anchor.
+fn looks_like_path(raw: &str) -> bool {
+    raw.starts_with(['.', '/']) || Path::new(raw).is_absolute()
+}
+
+/// Parse one `uvr add` argument. The registry/remote grammar lives in
+/// [`uvr_core::dep_spec`], shared with script headers; a local directory
+/// (`"../mypkg"`) is `uvr add` only. The name is provisional until
+/// `resolve_path_deps` reads DESCRIPTION.
 fn parse_add_spec(raw: &str, bioc: bool) -> Result<(String, DependencySpec)> {
+    let raw = raw.trim();
+    if looks_like_path(raw) {
+        let name = Path::new(raw)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let spec = DependencySpec::Detailed(DetailedDep {
+            path: Some(raw.to_string()),
+            ..Default::default()
+        });
+        return Ok((name, spec));
+    }
     Ok(uvr_core::dep_spec::parse(raw, bioc)?)
 }
 
@@ -89,6 +114,10 @@ pub async fn run(
             ));
         }
     }
+    // Local reads only, so this runs under `--no-lock` too: a missing or
+    // non-package directory fails here, before uvr.toml is touched.
+    let cwd = std::env::current_dir().context("Failed to read the current directory")?;
+    resolve_path_deps(&mut parsed, &cwd, &project.root)?;
 
     // For GitHub specs (`user/repo@ref`), the URL-derived basename is only a
     // provisional package name. R's actual package name lives in the
@@ -753,11 +782,71 @@ pub(crate) async fn resolve_url_pkg_names(parsed: &mut [(String, DependencySpec)
     Ok(())
 }
 
+/// Bind each path spec to its DESCRIPTION `Package:` name, and store its
+/// path relative to the manifest directory (`root`) rather than to `cwd`:
+/// `uvr add ../x` typed in a project subdirectory must record where `x` is.
+fn resolve_path_deps(
+    parsed: &mut [(String, DependencySpec)],
+    cwd: &Path,
+    root: &Path,
+) -> Result<()> {
+    for (name, spec) in parsed.iter_mut() {
+        let DependencySpec::Detailed(d) = spec else {
+            continue;
+        };
+        let Some(raw) = d.path.as_deref() else {
+            continue;
+        };
+        let path = manifest_relative(raw, cwd, root);
+        let (info, _, _) = uvr_core::registry::local::resolve_local_package(root, &path)?;
+        *name = info.name;
+        d.path = Some(path);
+    }
+    Ok(())
+}
+
+/// `raw`, typed in `cwd`, as a path relative to `root`. Kept verbatim when
+/// absolute or typed at the root. Only the leading `..` of `raw` are folded,
+/// into the part of `cwd` below `root`: that part is the real directory
+/// chain `cwd` resolved through, so the fold cannot cross a symlink.
+fn manifest_relative(raw: &str, cwd: &Path, root: &Path) -> String {
+    if Path::new(raw).is_absolute() || cwd == root {
+        return raw.to_string();
+    }
+    let Ok(sub) = cwd.strip_prefix(root) else {
+        return cwd.join(raw).to_string_lossy().into_owned();
+    };
+    let mut base: Vec<Component> = sub.components().collect();
+    let mut rest = Path::new(raw).components().peekable();
+    while let Some(component) = rest.peek() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if !base.is_empty() => {
+                base.pop();
+            }
+            _ => break,
+        }
+        rest.next();
+    }
+    let parts: Vec<String> = base
+        .into_iter()
+        .chain(rest)
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
 fn format_spec(spec: &DependencySpec) -> String {
     match spec {
         DependencySpec::Version(v) => v.clone(),
         DependencySpec::Detailed(d) => {
-            if let Some(url) = &d.url {
+            if let Some(path) = &d.path {
+                path.clone()
+            } else if let Some(url) = &d.url {
                 url.clone()
             } else if let Some(git) = &d.git {
                 let rev = d.rev.as_deref().unwrap_or("HEAD");
@@ -931,10 +1020,11 @@ mod tests {
         for ok in ["data.table", "owner/my-pkg_1"] {
             assert!(parse_add_spec(ok, false).is_ok(), "should accept {ok}");
         }
+        // `..` is path syntax now; `resolve_path_deps` rejects it when it is
+        // not a package directory.
         for bad in [
             "bad+name",
             "my pkg",
-            "..",
             "owner/bad+name",
             "owner/my pkg",
             "owner/..",
@@ -955,7 +1045,6 @@ mod tests {
             "owner/repo#pull/12",
             "owner/repo@#subdirectory=nested",
             "owner/@main#subdirectory=nested",
-            "/repo@main#subdirectory=nested",
         ] {
             assert!(parse_add_spec(bad, false).is_err(), "should reject {bad}");
         }
@@ -1082,7 +1171,6 @@ mod tests {
 
     #[test]
     fn parse_invalid_github() {
-        assert!(parse_add_spec("/", false).is_err());
         assert!(parse_add_spec("a//b", false).is_err());
         // `user/repo/extra` is now the package directory `extra` (#312).
         assert!(parse_add_spec("user//extra", false).is_err());
@@ -1165,6 +1253,115 @@ mod tests {
         for raw in ["user//extra", "user/repo/", "user/repo:"] {
             let msg = parse_add_spec(raw, false).unwrap_err().to_string();
             assert!(msg.contains("Invalid GitHub spec"), "{raw}: {msg}");
+        }
+    }
+
+    #[test]
+    fn path_syntax_is_sniffed_and_other_specs_are_unchanged() {
+        for raw in ["../mypkg", "./mypkg", ".", "..", "/", "/srv/mypkg"] {
+            let (_, spec) = parse_add_spec(raw, false).unwrap();
+            assert_eq!(spec.path(), Some(raw), "{raw}");
+            assert_eq!(spec.git(), None, "{raw}");
+        }
+        // Formerly malformed GitHub specs that now read as (missing) paths.
+        assert_eq!(
+            parse_add_spec("/repo@main#subdirectory=nested", false)
+                .unwrap()
+                .1
+                .path(),
+            Some("/repo@main#subdirectory=nested")
+        );
+        #[cfg(windows)]
+        assert!(parse_add_spec(r"C:\dev\mypkg", false)
+            .unwrap()
+            .1
+            .path()
+            .is_some());
+
+        // Nothing without explicit path syntax becomes a path, whatever
+        // exists on disk: parse_add_spec never looks.
+        for raw in [
+            "mypkg",
+            "data.table",
+            "pkg@>=1.0",
+            "owner/repo",
+            "owner/repo@main",
+            "forgejo::codefloe.com/o/r",
+            "gitlab::gitlab.com/g/p",
+        ] {
+            let (_, spec) = parse_add_spec(raw, false).unwrap();
+            assert_eq!(spec.path(), None, "{raw}");
+        }
+        let (_, spec) = parse_add_spec("../mypkg", false).unwrap();
+        assert_eq!(format_spec(&spec), "../mypkg");
+    }
+
+    fn write_pkg(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("DESCRIPTION"),
+            format!("Package: {name}\nVersion: 0.1.0\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn path_deps_take_the_description_name_and_a_manifest_relative_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        let sub = root.join("analysis").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        write_pkg(&tmp.path().join("my-checkout"), "realname");
+
+        // At the root the path is kept as typed; the directory name is not
+        // the package name.
+        let mut parsed = vec![parse_add_spec("../my-checkout", false).unwrap()];
+        resolve_path_deps(&mut parsed, &root, &root).unwrap();
+        assert_eq!(parsed[0].0, "realname");
+        assert_eq!(parsed[0].1.path(), Some("../my-checkout"));
+
+        // Typed two levels down, it is rewritten relative to the manifest.
+        let mut parsed = vec![parse_add_spec("../../../my-checkout", false).unwrap()];
+        resolve_path_deps(&mut parsed, &sub, &root).unwrap();
+        assert_eq!(parsed[0].1.path(), Some("../my-checkout"));
+
+        let mut parsed = vec![parse_add_spec("./vendored", false).unwrap()];
+        write_pkg(&sub.join("vendored"), "vendored");
+        resolve_path_deps(&mut parsed, &sub, &root).unwrap();
+        assert_eq!(parsed[0].1.path(), Some("analysis/deep/vendored"));
+
+        // An absolute path is kept as is.
+        let abs = tmp.path().join("my-checkout");
+        let abs = abs.to_str().unwrap();
+        let mut parsed = vec![parse_add_spec(abs, false).unwrap()];
+        resolve_path_deps(&mut parsed, &sub, &root).unwrap();
+        assert_eq!(parsed[0].1.path(), Some(abs));
+    }
+
+    #[test]
+    fn manifest_relative_folds_only_leading_parent_dirs() {
+        let root = Path::new("/p");
+        let cwd = Path::new("/p/a/b");
+        assert_eq!(manifest_relative("..", cwd, root), "a");
+        assert_eq!(manifest_relative("../..", cwd, root), ".");
+        assert_eq!(manifest_relative("../../../x", cwd, root), "../x");
+        assert_eq!(manifest_relative("./x/../y", cwd, root), "a/b/x/../y");
+        assert_eq!(manifest_relative("../x", root, root), "../x");
+    }
+
+    #[test]
+    fn path_deps_that_are_missing_or_not_packages_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notpkg")).unwrap();
+        for (raw, want) in [
+            ("./missing", "does not exist"),
+            ("./notpkg", "is not an R package"),
+        ] {
+            let mut parsed = vec![parse_add_spec(raw, false).unwrap()];
+            let err = resolve_path_deps(&mut parsed, tmp.path(), tmp.path())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{raw}: {err}");
         }
     }
 
