@@ -554,9 +554,11 @@ fn tally(entries: &[PruneEntry], reason: PruneReason) -> (u64, u64) {
 
 /// Find what `uvr cache prune` removes, without removing anything.
 ///
-/// Download cache (top-level regular files only; directories such as
-/// `with-envs/` and symlinks are never candidates):
+/// Download cache (top-level entries only; symlinks and directories such as
+/// `with-envs/` are never candidates):
 /// - `.uvr-dl-*` files: partial downloads (`download_one`'s temp files);
+/// - `.uvr-git-*` directories: repositories of an interrupted git fetch
+///   (`git_generic::fetch_tarball`);
 /// - `*.sha256` sidecars whose tarball is gone;
 /// - with `ci`, every other file too.
 ///
@@ -613,6 +615,27 @@ fn plan_prune(
             plan.entries.push(PruneEntry {
                 reason,
                 bytes: meta.len(),
+                path,
+            });
+        }
+
+        for entry in std::fs::read_dir(cache_dir)
+            .with_context(|| format!("Cannot read cache dir {}", cache_dir.display()))?
+            .flatten()
+        {
+            let is_git_stage = entry.file_type().is_ok_and(|ft| ft.is_dir())
+                && entry.file_name().to_string_lossy().starts_with(".uvr-git-");
+            if !is_git_stage {
+                continue;
+            }
+            if !entry.metadata().is_ok_and(|m| is_older_than(&m, min_age)) {
+                plan.young_skipped += 1;
+                continue;
+            }
+            let path = entry.path();
+            plan.entries.push(PruneEntry {
+                reason: PruneReason::Orphan,
+                bytes: dir_size(&path),
                 path,
             });
         }
@@ -985,6 +1008,9 @@ mod tests {
         ] {
             std::fs::write(cache.join(name), body).unwrap();
         }
+        // Repository of an interrupted git fetch.
+        std::fs::create_dir_all(cache.join(".uvr-git-XyZ/objects")).unwrap();
+        std::fs::write(cache.join(".uvr-git-XyZ/objects/pack"), "git").unwrap();
 
         make_cache_entry(&packages, "rlang", "1.1.4", HEX32, Some("4.5"));
         make_cache_entry(&packages, "old", "1.0", HEX32, Some("3.6"));
@@ -1031,6 +1057,7 @@ mod tests {
             vec![
                 (PruneReason::Orphan, ".tmpStaging".to_string()),
                 (PruneReason::Orphan, ".uvr-dl-AbC123".to_string()),
+                (PruneReason::Orphan, ".uvr-git-XyZ".to_string()),
                 (
                     PruneReason::Orphan,
                     "eeeeeeee-gone_1.0.tar.sha256".to_string()
@@ -1052,8 +1079,8 @@ mod tests {
         let (removed, failed) = remove_planned(plan.entries);
 
         assert!(failed.is_empty(), "unexpected failures: {failed:?}");
-        // "Package: pkg\n" (13) + "partial" (7) + "orphan" (6)
-        assert_eq!(tally(&removed, PruneReason::Orphan), (3, 26));
+        // "Package: pkg\n" (13) + "partial" (7) + "git" (3) + "orphan" (6)
+        assert_eq!(tally(&removed, PruneReason::Orphan), (4, 29));
         // "Package: old\n" (13) + "r_minor=3.6\nkind=binary\n" (24)
         assert_eq!(tally(&removed, PruneReason::StaleR), (1, 37));
         assert_eq!(tally(&removed, PruneReason::Download), (0, 0));
@@ -1096,7 +1123,7 @@ mod tests {
                 (PruneReason::StaleR, format!("old-1.0-{HEX32}")),
             ]
         );
-        assert_eq!(plan.young_skipped, 2, "kept leftovers are reported");
+        assert_eq!(plan.young_skipped, 3, "kept leftovers are reported");
     }
 
     #[test]
@@ -1107,7 +1134,7 @@ mod tests {
         let plan = plan_prune(&cache, &packages, &[], false, Duration::ZERO).unwrap();
 
         assert_eq!(tally(&plan.entries, PruneReason::StaleR), (0, 0));
-        assert_eq!(tally(&plan.entries, PruneReason::Orphan).0, 3);
+        assert_eq!(tally(&plan.entries, PruneReason::Orphan).0, 4);
         assert_eq!(plan.legacy_skipped, 0);
     }
 
@@ -1122,7 +1149,7 @@ mod tests {
         // Every top-level file except the two orphans:
         // 5 + 9 + 3 + 7 + 2 + 6 + 5 + 5 bytes.
         assert_eq!(tally(&removed, PruneReason::Download), (8, 42));
-        assert_eq!(tally(&removed, PruneReason::Orphan).0, 3);
+        assert_eq!(tally(&removed, PruneReason::Orphan).0, 4);
         assert_eq!(tally(&removed, PruneReason::StaleR).0, 1);
         let left: Vec<_> = std::fs::read_dir(&cache)
             .unwrap()
