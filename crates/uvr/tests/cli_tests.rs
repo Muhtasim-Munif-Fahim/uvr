@@ -931,8 +931,9 @@ fn test_cache_dir_prints_only_the_path() {
 }
 
 #[test]
-fn test_cache_size_matches_doctor() {
-    // #191: `cache size` is the sum of the two figures `uvr doctor` shows.
+fn test_cache_size_includes_cache_subdirectories() {
+    // #191: `cache size` covers what `uvr doctor` shows, plus the download
+    // cache's subdirectories, which doctor's file count leaves out.
     let home = TempDir::new().unwrap();
     let cache = home.path().join("cache");
     let packages = home.path().join("packages");
@@ -943,6 +944,8 @@ fn test_cache_size_matches_doctor() {
     fs::write(cache.join("aabbccdd-pkg_1.0.tar.gz"), vec![0u8; 2048]).unwrap();
     fs::create_dir_all(&entry).unwrap();
     fs::write(entry.join("libs.so"), vec![0u8; 3072]).unwrap();
+    fs::create_dir_all(cache.join("cran-history")).unwrap();
+    fs::write(cache.join("cran-history").join("pkg.json"), vec![0u8; 1024]).unwrap();
 
     let run = |args: &[&str]| {
         uvr_cmd()
@@ -956,7 +959,7 @@ fn test_cache_size_matches_doctor() {
             .success()
     };
 
-    run(&["cache", "size"]).stdout("5.0 KB\n");
+    run(&["cache", "size"]).stdout("6.0 KB\n");
     run(&["doctor"])
         .stdout(predicate::str::contains("1 file(s), 2.0 KB"))
         .stdout(predicate::str::contains("1 entries, 3.0 KB"));

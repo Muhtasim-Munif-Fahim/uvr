@@ -138,19 +138,30 @@ pub fn run_dir() -> Result<()> {
 }
 
 /// `uvr cache size` — print the combined size of the download cache and the
-/// extracted-package cache. Both figures come from the helpers `uvr doctor`
-/// uses, so the two commands always agree.
+/// extracted-package cache.
 pub fn run_size() {
-    let downloads = uvr_core::env_vars::cache_dir()
-        .map(|dir| download_cache_stats(&dir).1)
+    // The whole download cache, subdirectories included (`cran-history/`,
+    // `with-envs/`), unlike doctor's top-level file count.
+    let cache_dir = uvr_core::env_vars::cache_dir();
+    let downloads = cache_dir
+        .as_deref()
+        .map(package_cache::dir_size)
         .unwrap_or(0);
-    let (_, packages) = package_cache::cache_stats();
+    // A package cache placed inside the download cache is already counted.
+    let nested = cache_dir
+        .as_deref()
+        .is_some_and(|dir| package_cache::global_packages_dir().starts_with(dir));
+    let packages = if nested {
+        0
+    } else {
+        package_cache::cache_stats().1
+    };
     println!("{}", ui::palette::format_bytes(downloads + packages));
 }
 
 /// File count and total bytes of the top-level files in the download cache.
 /// Subdirectories (such as `with-envs/` from `uvr run --with`) are not
-/// counted. Shared by `uvr doctor` and `uvr cache size`.
+/// counted; `uvr cache size` measures those too.
 pub fn download_cache_stats(dir: &Path) -> (usize, u64) {
     let mut count = 0usize;
     let mut size = 0u64;
