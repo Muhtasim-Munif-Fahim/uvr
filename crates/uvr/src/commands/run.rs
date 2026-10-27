@@ -1,21 +1,27 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 
+use uvr_core::error::UvrError;
 use uvr_core::manifest::{DependencySpec, Manifest};
 use uvr_core::project::{ManifestSource, Project};
 use uvr_core::r_env::REnv;
 use uvr_core::r_version::detector::{find_r_binary, find_r_binary_ignoring_pin, query_r_version};
+use uvr_core::r_version::downloader::{fetch_available_versions, newest_satisfying, Platform};
 use uvr_core::script_header::{self, ScriptHeader};
 
 pub async fn run(
     script: Option<String>,
     r_version_override: Option<String>,
-    mut with_packages: Vec<String>,
+    with_packages: Vec<String>,
     args: Vec<String>,
 ) -> Result<()> {
+    // Whatever R prints is the command's output (`uvr run x.R > out.csv`),
+    // so uvr's own status lines, such as an install summary, go to stderr.
+    crate::ui::reserve_stdout();
+
     // A script carrying an inline dependency header runs *standalone*: the
     // surrounding project is ignored entirely, which is exactly what lets the
     // same file reproduce in any directory on anyone's machine (#181).
@@ -24,19 +30,7 @@ pub async fn run(
         None => None,
     };
     let script_mode = header.is_some();
-
-    if let Some(constraint) = header.as_ref().and_then(|h| h.r.as_deref()) {
-        // Parsed, but #183 is what makes it select an R. Saying so beats
-        // running against whichever interpreter happens to be around and
-        // letting the script fail somewhere less obvious. The constraint is
-        // free text from the header — control-escape it, or a crafted `r`
-        // value could smuggle ANSI sequences into uvr's own diagnostics.
-        crate::ui::warn(format!(
-            "script header pins R `{}`, which uvr does not honour yet (#183) — \
-             running against the R resolved as usual",
-            script_header::sanitize_for_display(constraint)
-        ));
-    }
+    let header_constraint = header.as_ref().and_then(|h| h.r.as_deref());
 
     // Resolve project (optional — uvr run works outside a project too).
     // Skipped in script mode, so a headered script neither inherits the
@@ -56,9 +50,11 @@ pub async fn run(
         }
     };
 
-    // --r-version flag takes priority over the project constraint.
+    // --r-version flag takes priority over the header's `r`, and both over
+    // the project constraint (which script mode never reads anyway).
     let effective_constraint = r_version_override
         .as_deref()
+        .or(header_constraint)
         .or(project_r_constraint.as_deref());
 
     // In script mode a `.r-version` pin is ignored along with the rest of the
@@ -66,23 +62,35 @@ pub async fn run(
     // one, and the pin outranks every other signal — so honouring it would
     // let the directory a script happens to sit in choose its interpreter,
     // and with it the ephemeral environment's cache key.
-    let r_binary = if script_mode {
+    let found = if script_mode {
         find_r_binary_ignoring_pin(effective_constraint)
     } else {
         find_r_binary(effective_constraint)
-    }
-    .context("R not found. Install R or use `uvr r install <version>`")?;
+    };
+    // Only the header's own `r` may download an R (#183): `--r-version` is
+    // an explicit choice, and fails as it always has when nothing matches.
+    let provisionable = header_constraint.filter(|_| r_version_override.is_none());
+    let r_binary = match (found, provisionable) {
+        (Err(UvrError::RNotFound | UvrError::RVersionUnsatisfied { .. }), Some(constraint)) => {
+            provision_r(constraint, script.as_deref().unwrap_or_default()).await?
+        }
+        (found, _) => found.context("R not found. Install R or use `uvr r install <version>`")?,
+    };
 
     // A headered script's dependencies join any `--with` packages in a single
-    // ephemeral environment.
+    // ephemeral environment. `--with` takes bare names only.
+    let mut deps: Vec<(String, DependencySpec)> = with_packages
+        .into_iter()
+        .map(|pkg| (pkg, DependencySpec::default()))
+        .collect();
     if let Some(header) = &header {
-        with_packages.extend(header.dependencies.iter().cloned());
+        deps.extend(header.dependencies.iter().cloned());
     }
 
     // Script mode always builds an environment, even when the header declares
     // no packages: an empty isolated library is still the right answer, and is
     // not the same thing as falling back to whatever the machine provides.
-    let with_env = if with_packages.is_empty() && !script_mode {
+    let with_env = if deps.is_empty() && !script_mode {
         None
     } else {
         // The R version is part of the --with cache key (see ensure_with_env).
@@ -96,7 +104,7 @@ pub async fn run(
                 r_binary.display()
             )
         })?;
-        Some(ensure_with_env(&with_packages, &r_ver).await?)
+        Some(ensure_with_env(&deps, &r_ver).await?)
     };
 
     let (library, with_library) = match with_env {
@@ -128,8 +136,13 @@ pub async fn run(
         cmd.env(key, value);
     }
     // Belt and braces alongside the blank `R_ENVIRON`: a process flag is
-    // available here, but not to a sourced activation script.
-    cmd.arg("--no-environ");
+    // available here, but not to a sourced activation script. Skipped under
+    // `UVR_USER_ENVIRON=1`, which exists to let `~/.Renviron` through (#260)
+    // — the flag suppresses every environment file, so leaving it on would
+    // undo the opt-out for `uvr run` while activation honoured it.
+    if !uvr_core::env_vars::user_environ() {
+        cmd.arg("--no-environ");
+    }
 
     if script_mode {
         // Set here rather than in `REnv::vars()` for the same reason as
@@ -199,6 +212,46 @@ fn read_header(path: &str) -> Result<Option<ScriptHeader>> {
     script_header::parse(&source).map_err(|e| anyhow!("Invalid script header in {path}: {e}"))
 }
 
+/// Install the newest R that satisfies a script header's `r` constraint —
+/// called when no installed R does — and return its binary (#183).
+///
+/// `UVR_R_DOWNLOADS=never` turns this into an error that names the
+/// constraint, for machines where uvr must not fetch an interpreter.
+async fn provision_r(constraint: &str, script: &str) -> Result<PathBuf> {
+    // Validated when the header was parsed, but still text from a file that
+    // may have come from anyone.
+    let shown = script_header::sanitize_for_display(constraint);
+    if !uvr_core::env_vars::r_downloads_allowed()? {
+        bail!(
+            "No R satisfies \"{shown}\" for {script}; install one \
+             (`uvr r install <version>`) or set UVR_R_DOWNLOADS=auto."
+        );
+    }
+
+    // Said before any network access, so an offline failure below still
+    // explains why uvr went looking.
+    crate::ui::info_err(format!("No installed R satisfies \"{shown}\" for {script}"));
+
+    // `.stable` holds only what this platform publishes, so the pick below
+    // never lands on a version the CDN would refuse (#215).
+    let client = crate::commands::util::build_client()?;
+    let platform = Platform::detect().context("Unsupported platform")?;
+    let available = fetch_available_versions(&client, platform)
+        .await
+        .context("Failed to fetch available R versions")?;
+    let Some(version) = newest_satisfying(&available.stable, constraint)? else {
+        bail!(
+            "No R satisfies \"{shown}\" for {script}, and no R published for this \
+             platform does either. See `uvr r list --all`."
+        );
+    };
+    crate::commands::r_cmd::install::install(&version, None, true).await?;
+
+    // Looked up again rather than built from the install path, so the new R
+    // passes the same checks as any installed one before it is used.
+    Ok(find_r_binary_ignoring_pin(Some(constraint))?)
+}
+
 /// Library used when `uvr run` is invoked outside a project.
 fn fallback_library() -> PathBuf {
     dirs::data_local_dir()
@@ -212,18 +265,74 @@ fn fallback_library() -> PathBuf {
         .join("library")
 }
 
+/// Sort `deps` by name and collapse each package to one entry, so the same
+/// set in any order — including a package named both in a header and via
+/// `--with` — reuses one environment.
+///
+/// A bare name yields to a real spec for the same package (`--with ggplot2`
+/// beside a header's `ggplot2>=3.4`). Two different real specs for one
+/// package are an error: the manifest holds one spec per name, so one of
+/// them would otherwise be dropped without a word.
+///
+/// A git or URL entry is named after its repository or file until its
+/// DESCRIPTION is read, so two of them sharing a name (`.../main.tar.gz`)
+/// are both kept here; the caller checks again once the names are real.
+fn canonical_deps(deps: &[(String, DependencySpec)]) -> Result<Vec<(String, DependencySpec)>> {
+    let bare = DependencySpec::default();
+    let provisional = |spec: &DependencySpec| spec.git().is_some() || spec.url().is_some();
+    let mut sorted = deps.to_vec();
+    // By name, then by spec, so the same set in any order gives one key.
+    sorted.sort_by_cached_key(|(name, spec)| (name.clone(), cache_entry(name, spec)));
+    let mut out: Vec<(String, DependencySpec)> = Vec::with_capacity(sorted.len());
+    for (name, spec) in sorted {
+        match out.last_mut() {
+            Some((prev, prev_spec))
+                if *prev == name
+                    && !(provisional(prev_spec) && provisional(&spec) && *prev_spec != spec) =>
+            {
+                if *prev_spec == bare {
+                    *prev_spec = spec;
+                } else if spec != bare && spec != *prev_spec {
+                    anyhow::bail!(
+                        "`{}` is requested twice with different specs; keep one",
+                        script_header::sanitize_for_display(&name)
+                    );
+                }
+            }
+            _ => out.push((name, spec)),
+        }
+    }
+    Ok(out)
+}
+
+/// One package's contribution to [`with_env_key`].
+///
+/// A bare name contributes exactly the name, as it always has, so existing
+/// environments keep their keys (#182). Anything more specific appends its
+/// serialized spec after an `@`, so two headers differing only by version,
+/// channel or ref get different environments. The JSON form is `uvr.toml`'s
+/// own serde shape: fields that are unset are skipped, so a field added to
+/// `DetailedDep` later leaves existing keys alone as long as it is skipped
+/// when unset too.
+fn cache_entry(name: &str, spec: &DependencySpec) -> String {
+    if *spec == DependencySpec::default() {
+        return name.to_string();
+    }
+    let spec = serde_json::to_string(spec).expect("a DependencySpec always serializes");
+    format!("{name}@{spec}")
+}
+
 /// Cache key for an ephemeral environment: the directory name under
 /// `<cache>/with-envs/`.
 ///
-/// `packages` must already be sorted and de-duplicated, so the same set in
-/// any order — including a package named both in a header and via `--with` —
-/// reuses one environment. The R version is part of the key because compiled
-/// packages are ABI-bound to an R minor (#160).
+/// `packages` are [`cache_entry`] strings of [`canonical_deps`] output. The R
+/// version is part of the key because compiled packages are ABI-bound to an
+/// R minor (#160).
 ///
 /// **This function's output is a compatibility surface.** Changing it silently
 /// orphans every cached environment on every user's machine, so the tests pin
-/// a golden value — #182 generalises the header grammar and must keep a bare
-/// package name hashing exactly as it does now.
+/// golden values: a bare package name must keep hashing exactly as it did
+/// before #182 generalised the header grammar.
 fn with_env_key(packages: &[String], r_version: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(r_version.as_bytes());
@@ -234,16 +343,15 @@ fn with_env_key(packages: &[String], r_version: &str) -> String {
     format!("{:x}", hasher.finalize())[..12].to_string()
 }
 
-/// Ensure the `--with` packages are installed in a cached environment.
-/// Returns the path to the cached library directory.
-async fn ensure_with_env(packages: &[String], r_version: &str) -> Result<PathBuf> {
-    let mut sorted = packages.to_vec();
-    sorted.sort();
+/// Ensure the `--with` and header dependencies are installed in a cached
+/// environment. Returns the path to the cached library directory.
+async fn ensure_with_env(deps: &[(String, DependencySpec)], r_version: &str) -> Result<PathBuf> {
     // Same package from the header and `--with` (or listed twice) is one
     // logical set — without this it would mint a second cache dir and
     // install everything again.
-    sorted.dedup();
-    let short_hash = with_env_key(&sorted, r_version);
+    let mut deps = canonical_deps(deps)?;
+    let entries: Vec<String> = deps.iter().map(|(n, s)| cache_entry(n, s)).collect();
+    let short_hash = with_env_key(&entries, r_version);
 
     let cache_dir = uvr_core::env_vars::cache_dir()
         .unwrap_or_else(|| {
@@ -269,18 +377,33 @@ async fn ensure_with_env(packages: &[String], r_version: &str) -> Result<PathBuf
         .with_context(|| format!("Failed to create {}", lib_dir.display()))?;
 
     // Check if all requested packages are already installed.
-    let all_installed = sorted
-        .iter()
-        .all(|pkg| lib_dir.join(pkg).join("DESCRIPTION").exists());
-
-    if all_installed {
+    let all_installed = |deps: &[(String, DependencySpec)]| {
+        deps.iter()
+            .all(|(pkg, _)| lib_dir.join(pkg).join("DESCRIPTION").exists())
+    };
+    if all_installed(&deps) {
         return Ok(lib_dir);
     }
 
-    // Build a temporary manifest with the --with packages.
+    // A git spec is named after its repository, and a URL tarball after its
+    // file name, until the DESCRIPTION says otherwise (`satijalab/seurat`
+    // ships `Seurat`); the manifest must use the real name, exactly as
+    // `uvr add` does. The cache key above stays
+    // on the name as written, so a warm run never needs the network.
+    // ponytail: a renamed git package costs this DESCRIPTION fetch on every
+    // run; record the resolved names in the env dir if that ever matters.
+    crate::commands::add::resolve_git_pkg_names(&mut deps).await?;
+    crate::commands::add::resolve_url_pkg_names(&mut deps).await?;
+    // Real names now: two entries for one package are a conflict again.
+    let deps = canonical_deps(&deps)?;
+    if all_installed(&deps) {
+        return Ok(lib_dir);
+    }
+
+    // Build a temporary manifest with the requested packages.
     let mut manifest = Manifest::new("__with__", None);
-    for pkg in &sorted {
-        manifest.add_dep(pkg.clone(), DependencySpec::default(), false);
+    for (pkg, spec) in &deps {
+        manifest.add_dep(pkg.clone(), spec.clone(), false);
     }
 
     let project = Project {
@@ -330,12 +453,37 @@ impl std::error::Error for ScriptExitError {}
 mod tests {
     use super::*;
 
+    /// The key `ensure_with_env` computes for `deps`.
+    fn spec_key(deps: &[(&str, DependencySpec)], r: &str) -> String {
+        let deps: Vec<_> = deps
+            .iter()
+            .map(|(n, s)| (n.to_string(), s.clone()))
+            .collect();
+        let entries: Vec<String> = canonical_deps(&deps)
+            .unwrap()
+            .iter()
+            .map(|(n, s)| cache_entry(n, s))
+            .collect();
+        with_env_key(&entries, r)
+    }
+
+    /// The key for bare names — what `--with` and plain header entries give.
     fn key(pkgs: &[&str], r: &str) -> String {
-        // Mirrors ensure_with_env's canonicalisation.
-        let mut sorted: Vec<String> = pkgs.iter().map(|s| s.to_string()).collect();
-        sorted.sort();
-        sorted.dedup();
-        with_env_key(&sorted, r)
+        let deps: Vec<_> = pkgs
+            .iter()
+            .map(|p| (*p, DependencySpec::default()))
+            .collect();
+        spec_key(&deps, r)
+    }
+
+    /// The key for header entries, parsed as `uvr run` parses them.
+    fn header_key(specs: &[&str], r: &str) -> String {
+        let deps: Vec<_> = specs
+            .iter()
+            .map(|s| uvr_core::dep_spec::parse(s, false).unwrap())
+            .collect();
+        let deps: Vec<_> = deps.iter().map(|(n, s)| (n.as_str(), s.clone())).collect();
+        spec_key(&deps, r)
     }
 
     #[test]
@@ -373,5 +521,102 @@ mod tests {
         // test exists to make that a deliberate decision rather than a
         // side effect.
         assert_eq!(key(&["jsonlite"], "4.4.2"), "c449740c65a0");
+        // A set, not just one name: pins the separator and the ordering too.
+        // Both values were computed on upstream/main before #182.
+        assert_eq!(key(&["jsonlite", "cli"], "4.4.2"), "370056f5a939");
+        assert_eq!(
+            key(&["praise", "jsonlite", "ggplot2", "praise"], "4.5.1"),
+            "5816a50b3060"
+        );
+        // The same names written in a header parse to the default spec and
+        // land on the same keys.
+        assert_eq!(header_key(&["jsonlite"], "4.4.2"), "c449740c65a0");
+        assert_eq!(
+            header_key(&["jsonlite", "cli", "cli@*"], "4.4.2"),
+            "370056f5a939"
+        );
+    }
+
+    #[test]
+    fn headers_differing_only_by_spec_get_different_environments() {
+        let bare = header_key(&["jsonlite"], "4.4.2");
+        let v18 = header_key(&["jsonlite>=1.8"], "4.4.2");
+        assert_ne!(bare, v18);
+        assert_ne!(v18, header_key(&["jsonlite>=1.9"], "4.4.2"));
+        // One constraint, two spellings: one environment.
+        assert_eq!(v18, header_key(&["jsonlite@>=1.8"], "4.4.2"));
+        // Channel and ref are part of the spec too.
+        assert_ne!(
+            header_key(&["limma"], "4.4.2"),
+            header_key(&["limma (bioc)"], "4.4.2")
+        );
+        assert_ne!(
+            header_key(&["rladies/praise@v1"], "4.4.2"),
+            header_key(&["rladies/praise@main"], "4.4.2")
+        );
+        assert_ne!(
+            header_key(&["praise"], "4.4.2"),
+            header_key(&["rladies/praise"], "4.4.2")
+        );
+    }
+
+    #[test]
+    fn a_bare_name_yields_to_a_spec_for_the_same_package() {
+        // `uvr run --with jsonlite script.R` whose header pins jsonlite: one
+        // package, and the pin is what gets installed.
+        let pinned = DependencySpec::Version(">=1.8".to_string());
+        let deps = vec![
+            ("jsonlite".to_string(), DependencySpec::default()),
+            ("jsonlite".to_string(), pinned.clone()),
+        ];
+        assert_eq!(
+            canonical_deps(&deps).unwrap(),
+            vec![("jsonlite".to_string(), pinned.clone())]
+        );
+        let reversed: Vec<_> = deps.iter().rev().cloned().collect();
+        assert_eq!(
+            canonical_deps(&reversed).unwrap(),
+            canonical_deps(&deps).unwrap()
+        );
+    }
+
+    #[test]
+    fn git_and_url_entries_sharing_a_placeholder_name_are_both_kept() {
+        let url = |u: &str| {
+            DependencySpec::Detailed(uvr_core::manifest::DetailedDep {
+                url: Some(u.into()),
+                ..Default::default()
+            })
+        };
+        let a = url("https://github.com/a/pkga/archive/refs/heads/main.tar.gz");
+        let b = url("https://github.com/b/pkgb/archive/refs/heads/main.tar.gz");
+        let deps = vec![("main".to_string(), a.clone()), ("main".to_string(), b)];
+        assert_eq!(canonical_deps(&deps).unwrap().len(), 2);
+        // Either order gives one environment.
+        let reversed: Vec<_> = deps.iter().rev().cloned().collect();
+        assert_eq!(
+            canonical_deps(&deps).unwrap(),
+            canonical_deps(&reversed).unwrap()
+        );
+        // The same entry twice is still one.
+        let twice = vec![("main".to_string(), a.clone()), ("main".to_string(), a)];
+        assert_eq!(canonical_deps(&twice).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn two_different_specs_for_one_package_are_an_error() {
+        let deps = vec![
+            (
+                "jsonlite".to_string(),
+                DependencySpec::Version(">=1.8".to_string()),
+            ),
+            (
+                "jsonlite".to_string(),
+                DependencySpec::Version("<1.8".to_string()),
+            ),
+        ];
+        let err = canonical_deps(&deps).unwrap_err().to_string();
+        assert!(err.contains("jsonlite"), "{err}");
+        assert!(err.contains("different specs"), "{err}");
     }
 }

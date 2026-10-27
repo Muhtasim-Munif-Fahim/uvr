@@ -5,9 +5,317 @@ release page on GitHub. Issue numbers reference https://github.com/nbafrank/uvr/
 
 ## Unreleased
 
+Pure tracking section — fixes and small features land here between tags.
+
+- **Linux: `uvr r install` points the wrapper's first `R_HOME_DIR` at
+  `lib/R`** (#271). The v0.4.7 rewrite used the install root, which is
+  R_HOME on macOS but not on Linux, so Positron still failed to start a
+  uvr-managed R there. Applies to new installs; refresh an existing version
+  with `uvr r uninstall <ver> && uvr r install <ver>`. Thanks @SAY-5.
+- **`UVR_USER_ENVIRON=1` restores the user's `~/.Renviron` inside `uvr run`
+  and `uvr activate`** (#260). uvr blanks `R_ENVIRON_USER` so a `~/.Renviron`
+  setting `R_LIBS_USER` cannot silently override the project library, but that
+  defence is aimed at one variable and costs the whole file — API tokens,
+  `GITHUB_PAT`, proxy settings, TZ and locale went with it, while
+  `R CMD INSTALL` kept them. The opt-out is off by default and leaves the
+  *site* Renviron blanked either way.
+
+## v0.4.8 (2026-10-22)
+
+Scripts become self-contained: a `# /// script` header can pin versions,
+Bioconductor and git packages, and the R version itself, which `uvr run`
+installs when it is missing; `uvr add/remove --script` edit the header for
+you. Resolution gets uv's controls: test your declared floors with
+`--resolution lowest-direct`, reproduce an old analysis with
+`--exclude-newer <date>`, force or bound a transitive dependency with
+`[override-dependencies]` / `[constraint-dependencies]`, and move one
+package with `uvr lock -P`. Also: an opt-in host pin for repository
+credentials, `uvr sync` no longer deletes packages it did not install, and
+security updates for rustls, webpki and zip.
+
+Three adversarial reviews ran before this tag. They found that a cloned
+`uvr.lock` could steer a cache path through its snapshot date, that a date
+set with `--exclude-newer` was silently dropped by the next `uvr add`, and
+that `uvr run` mixed install output into a script's stdout. All are fixed
+here.
+
+Changes that may need action:
+- **`pkg = "==1.0.8"` now means exactly 1.0.8.** It used to match a
+  four-part release such as 1.0.8.3. uvr now locks 1.0.8 itself (from the
+  CRAN archive if needed), or fails if no repository has it.
+- **Repository tokens:** set `UVR_REPO_HOST_<NAME>` to your repository's
+  host, so a cloned `uvr.toml` that reuses the repository name cannot
+  receive the token.
+- **Shells activated with v0.4.7 or earlier:** start a new shell before
+  activating again with v0.4.8.
+
+Known issues, for v0.4.9: with old CRAN releases loaded (lowest modes,
+overrides), a four-part version such as 1.0.8.3 sorts below 1.0.8; and
+`uvr_deactivate` removes a Python venv's `deactivate` when the venv was
+activated after uvr.
+
+- **Pre-release review fixes.** `uvr run` writes uvr's own status lines
+  (install summaries, package-name notes) to stderr, so a script's stdout
+  holds only what the script prints. A script header in a file that starts
+  with a UTF-8 BOM is read, and `uvr add --script` no longer adds a second
+  header below it. Two git or URL header entries whose file names match
+  (`.../main.tar.gz`) no longer fail as "requested twice". `uvr add --script`
+  refuses `--resolution`, which it would ignore. In the default resolution
+  mode, an unreachable crandb no longer hides the resolver's own error. A
+  system package name that starts with `-` is never passed to dpkg/rpm/apk.
+
+- **Security updates for dependencies.** rustls 0.23.46, rustls-webpki
+  0.103.16, webpki-roots and webpki-root-certs 1.0.10 (distrusted emSign
+  intermediates), quinn-proto 0.11.18, and zip 9. uvr extracts zip archives
+  entry by entry with its own path checks, so the zip advisories (which
+  concern `ZipArchive::extract`) did not reach it.
+
+- **Override or constrain a dependency's version from `uvr.toml`** (#195).
+  `[override-dependencies]` sets a package to an exact version and ignores
+  what other packages (and `[dependencies]`) require of it; `uvr lock -v`
+  shows each requirement that an override ignores. `[constraint-dependencies]`
+  adds a version range that a package must satisfy if something pulls it in,
+  without adding it to the project. An override can select an archived CRAN
+  release. An exact version requirement (`== 1.0.8`) no longer matches a
+  four-part release such as 1.0.8.3.
+
+- **Resolve CRAN as of a date, to reproduce an old analysis** (#194).
+  `uvr lock --exclude-newer 2024-01-01`, or `[resolution] exclude-newer` in
+  `uvr.toml`, resolves CRAN packages from the Posit Package Manager snapshot
+  for that day. `uvr.lock` records the date as `resolved_as_of`, and
+  `uvr sync` installs the P3M binaries from the same snapshot. A date given
+  only on the command line stays in the lock: later `uvr add`, `uvr remove`,
+  `uvr lock -P` and `uvr update <pkg>` resolve at the same date until
+  `uvr.toml` names one or `uvr lock --upgrade` moves to today's CRAN. Bioconductor,
+  custom repositories, and git dependencies have no dated snapshot: uvr warns
+  once and resolves them from their current state. Without the option,
+  resolution is unchanged.
+
+- **Resolve to the lowest allowed versions, so declared floors get tested**
+  (#193). `uvr lock`, `uvr add`, and `uvr update` accept
+  `--resolution {highest,lowest,lowest-direct}`, and `uvr.toml` accepts
+  `[resolution] strategy`. `lowest` picks the oldest release that every
+  constraint allows, for all packages, as uv does. `lowest-direct` lowers
+  only the project's own dependencies. CRAN's index lists only current
+  releases, so uvr reads older releases from crandb (METACRAN), caches them,
+  and locks their CRAN Archive URL. A release that needs a package that has
+  left CRAN is skipped. The default (`highest`) is unchanged.
+
+- **`uvr lock --upgrade-package <pkg>` (`-P`) upgrades one package in
+  `uvr.lock` and nothing else** (#196). It is the lock-only form of
+  `uvr update <pkg>` and uses the same resolution: every other package is
+  held at its locked version, and a conflict with a held-back package is an
+  error that leaves `uvr.lock` unchanged. It installs nothing, so you can
+  review a single bump before `uvr sync`. A second run with nothing newer
+  does not write the file and says so. The flag is repeatable and cannot be
+  combined with `--upgrade`.
+
+- **`uvr add --script` and `uvr remove --script` edit a script's inline
+  header** (#184), like `uv add --script`. `uvr add <pkg…> --script s.R`
+  creates the `# /// script` block when there is none (after a shebang line),
+  replaces the spec of a package already listed, and writes new entries in
+  the header's own spellings (`ggplot2>=3.4`, `DESeq2 (bioc)`,
+  `owner/repo@ref`), so `uvr run` reads back exactly what was added. A sorted
+  list stays sorted and a hand-ordered one is appended to, so each edit is a
+  one-line diff. `uvr remove <pkg…> --script s.R` drops entries and deletes
+  the block once nothing is left in it. Only the `dependencies` lines change:
+  other keys, comments, CRLF line endings, the file's mode and the rest of the
+  script stay as they were. Neither command touches `uvr.toml` or `uvr.lock`
+  or installs anything; the next `uvr run` builds the environment.
+
+- **A script header can pin R, and uvr installs it if needed** (#183).
+  `# r = "~4.4"` in a `# /// script` header selects the newest installed R
+  that satisfies the constraint (the `uvr.toml` `r_version` grammar). If no
+  installed R does, `uvr run` installs the newest matching R published for
+  the platform, with the same backend and progress lines as `uvr r install`,
+  and then runs the script. `UVR_R_DOWNLOADS=never` (default `auto`) turns
+  the download off; the error then names the constraint. `--r-version` still
+  wins over the header and never downloads. An invalid `r` value is now a
+  header error. uvr's log lines (`INFO`/`WARN`) now go to stderr, so they no
+  longer mix into a script's stdout or into `uvr activate --emit` output.
+
+- **Script headers take the full `uvr add` spec vocabulary** (#182). A
+  `# /// script` entry can now carry a version constraint (`"ggplot2>=3.4"`
+  or `"ggplot2@>=3.4"`), a Bioconductor marker (`"DESeq2 (bioc)"`), or a git
+  source (`"user/repo@ref"`, `forgejo::…`, `gitlab::…`), so a shared script
+  pins what it needs. The ephemeral environment is keyed on the full specs,
+  so headers differing only by version get separate environments, while
+  plain names keep their existing cache keys and no environment is rebuilt.
+  One parser now serves both, so `uvr add` accepts the `pkg>=1.0` and
+  `pkg (bioc)` spellings too and rejects a malformed version constraint
+  before it touches `uvr.toml`.
+
+- **`UVR_REPO_HOST_<NAME>` binds a repository's credentials to its host.**
+  `UVR_REPO_TOKEN_<NAME>` and `UVR_REPO_USER/PASSWORD_<NAME>` are keyed by the
+  `[[sources]]` name, which a cloned `uvr.toml` chooses, so a project could
+  name your repository and point it at its own URL. With
+  `UVR_REPO_HOST_INTERNAL_PPM=ppm.corp.example` set, the variables go only to
+  that host (and port, if given); any other URL gets a warning and falls
+  through to `~/.netrc`. Without the pin nothing changes.
+
+- **`--unattended` no longer leaves `.uvr/` untracked.** `.uvr/` now holds a
+  `.gitignore` with `*`, so the library uvr creates stays out of `git status`
+  without editing the project's own `.gitignore`. `uvr activate` under
+  `--unattended` no longer writes the activation shims (and their
+  `.gitignore` entry); it prints `eval "$(uvr activate --emit sh)"` instead.
+
+- **`uvr add pkg` keeps an existing constraint.** Adding a package that
+  `uvr.toml` already lists, without a version, used to reset its constraint
+  to `*`. It now stays as written (with its comment), unless the add switches
+  the source (`--bioc`, a git spec, a URL). `uvr add --dev` for a runtime
+  dependency no longer lists it in both sections, and `uvr add` without
+  `--dev` moves a dev dependency to `[dependencies]`.
+
+- **`uvr scan` ignores `box::use(...)` inside strings**, and a `#` inside a
+  string no longer hides a `box::use` later on the same line.
+
+- **The OpenMP site profiles are replaced atomically**, so an R session
+  started by a concurrent `uvr run` never reads a half-written profile, and
+  a rewritten `Rprofile.site` keeps its file mode.
+
+- **`uvr lock` gets the base packages from the active R** (#169). The resolver
+  adds the names that `installed.packages(priority = "base")` gives to its
+  hardcoded list. Thus a base package that a new R release adds is not sent
+  to CRAN, where it fails with `PackageNotFound`. This costs one more R
+  start-up per lock, and only when lock finds R. Without R, the hardcoded list
+  (the R 4.6 set) applies as before.
+
+- **Failures that uvr used to drop silently are now reported** (#168).
+  `uvr cache clean` said "Cache is already empty" when it could not remove
+  anything (a permission error, for example), and it counted the package
+  cache as cleared without checking; it now counts only what it removed,
+  warns for each entry it could not remove, and exits non-zero when nothing
+  could be removed. If `uvr upgrade` cannot install the new binary and then
+  cannot put the old one back, the error now gives the path of the backup
+  and where to move it, instead of leaving no `uvr` and no explanation.
+  Failed cleanup of a broken R install, a failed registry cache-meta write,
+  a missing working directory during `.r-version` lookup, and an unusable
+  `Remotes:` entry (now with the name of the package that declares it) are
+  logged as warnings.
+
+- **A source build that fails because the compiler rejects R's `-std=` flag
+  now says why** (#231). R's `etc/Makeconf` records the compiler flags of the
+  host that built it, and R 4.5.1's musl build asks for `-std=gnu23`, which
+  gcc 13 (Alpine 3.20) does not know. R installed fine, then every package
+  with C code failed with only gcc's `unrecognized command-line option
+  '-std=gnu23'`. uvr now adds a hint that names the flag, says this R was
+  built for a newer compiler than the host has (gcc >= 14 or clang >= 18 for
+  C23), and suggests a newer compiler or an R build that matches the host.
+  The root cause is upstream in rstudio/r-builds.
+
+- **A source tarball served from a binary URL is now built from source
+  instead of failing the install** (#225). P3M's Linux repos serve source
+  and binary from the same URL, and fall back to source for any package
+  version not yet built for that repo, even though the index lists it. uvr
+  trusted the index and sent the source tarball down the binary path, so
+  `uvr add xml2` failed with "not a built binary package" on repos that had
+  not built xml2 1.6.0 yet (openSUSE 15.6 and Debian 12 when reported)
+  until a manual `uvr sync --no-binary`. uvr now reads the tarball's
+  `DESCRIPTION` first: no `Built:` field means source, so the package goes
+  through `R CMD INSTALL`, with the usual system-dependency check.
+  Binary-URL archives that do carry a `Built:` field still take the binary
+  path.
+
+- **`uvr sync` no longer deletes packages it did not install** (#255). Sync
+  removed every package in `.uvr/library/` that was not in `uvr.lock`. The
+  library is on `R_LIBS_USER` in an activated shell, so a package installed
+  there with `install.packages()`, or by a tool such as carrier, disappeared
+  on the next sync. uvr now writes a marker file,
+  `Meta/uvr-installed`, into each package it installs, whether it comes
+  from a binary, from `R CMD INSTALL`, or from the package cache. Sync
+  removes only unlocked packages that have the marker. It keeps the other
+  unlocked packages and lists them in one line. `uvr sync --prune-all`
+  restores the old behaviour. Existing libraries need no separate
+  migration step: each sync marks the installed packages that `uvr.lock`
+  lists, so after one sync with this version, `uvr remove` followed by
+  `uvr sync` cleans up as before. A package removed from the lockfile
+  before that first sync has no marker, so sync keeps it and lists it. A
+  package that you reinstall with R also loses the marker, because R
+  replaces the whole package directory.
+
+- **Activating a uvr project no longer breaks a Python virtual environment's
+  `deactivate`** (#303). A shell has one function namespace, so uvr's
+  `deactivate` replaced the venv's, and removing uvr's on the way out left the
+  shell with no `deactivate` at all and the venv still active. The work now
+  lives in `uvr_deactivate`, which every activation defines. `deactivate` is
+  an alias for it, created only when no other tool owns that name; when one
+  does, uvr says which name to use instead. Re-sourcing the shim also unwinds
+  through `uvr_deactivate`, so it can never tear down a venv. Reported by
+  @davidorme.
+
+- **`uvr add` accepts `owner/repo/subdir[@ref]` and `owner/repo:subdir[@ref]`**
+  (#312). These are the GitHub package-directory forms of DESCRIPTION
+  `Remotes:`. They give the same dependency as `owner/repo[@ref]#subdirectory=subdir`.
+
+## v0.4.7 (2026-10-08)
+
+Private and non-CRAN code becomes a first-class dependency: packages from
+authenticated repositories, from any git host, and from a tarball URL, with
+one credential resolver (environment variables, then `~/.netrc`) behind all
+of them. Lockfiles get stricter in the useful direction: `uvr sync --frozen`
+no longer breaks when CRAN publishes something new, git dependencies install
+from their locked commit, and `uvr add`/`uvr remove` stop rewriting your
+`uvr.toml`. IDE setup is now opt-in, with an explicit unattended mode for CI.
+
+Three adversarial reviews ran before this tag. They found that a git host's
+token could reach a lookalike host (and that the all-hosts GitLab/Forgejo
+tokens went to any host a project named), that re-locking could silently
+accept a changed URL tarball, and that `--frozen` rejected inline git refs.
+All are fixed here.
+
+Two changes may need action:
+- **Self-hosted GitLab/Forgejo:** use the per-host token variable. The
+  all-hosts `UVR_GITLAB_TOKEN` / `UVR_FORGEJO_TOKEN` now go only to
+  `gitlab.com` / `codeberg.org`, and a `-` in a host name is now `__` in the
+  variable name. uvr warns and prints the variable to set.
+- **`r_version = "4.5"` (no operator) now pins R 4.5.x**, as `.r-version`
+  and `uvr r use` always did. Write `">=4.5"` for a floor.
+
 - Verify installed and cached generic Git package provenance before reuse, including same-version content or origin changes. Frozen sync validates manifest inputs locally and restores the locked commit without following remote branch changes.
 
-Pure tracking section — fixes and small features land here between tags.
+- **A bare `r_version` pins R** (#320). `r_version = "4.5.3"` in `uvr.toml`
+  used to be read as the semver caret `^4.5.3`, so `uvr run` picked the
+  newest R (4.6.0) and then warned that it didn't match the pin, telling you
+  to install a version that was already installed. A bare version now
+  means what it means in `.r-version` and `uvr r use`: `"4.5.3"` is exactly
+  R 4.5.3, and `"4.5"` is the newest installed 4.5.x. Write `">=4.5"` or
+  `"^4.5"` for a range. `uvr run --r-version 4.5.3` follows the same rule,
+  and so does the `--frozen` check of the locked R. `uvr import` now writes
+  the R from `renv.lock` as a floor (`">=4.2.1"`), because renv records the
+  R a lock was made with, not one the project requires.
+
+- **Pre-release review fixes.**
+  - `uvr lock` without `--upgrade`, and `uvr add` of another package, now
+    refuse a URL tarball whose file changed since `uvr.lock` was written,
+    instead of quietly recording the new checksum. Only `uvr lock --upgrade`
+    accepts it.
+  - `uvr sync --frozen` accepts `git = "git::<url>@<ref>"` written inline. It
+    used to reject every such lock as not matching its Git dependency.
+  - A `url =` dependency with a `user:password@` part is rejected, because
+    the secret would be written into `uvr.toml` and `uvr.lock`.
+  - A `[[sources]]` credential is no longer sent over plain `http://`, except
+    to `localhost`; uvr warns instead.
+  - `UVR_GITLAB_TOKEN*` and `UVR_FORGEJO_TOKEN*` are kept out of
+    `R CMD INSTALL`, like the other uvr credentials.
+  - **Breaking, for self-hosted GitLab and Forgejo.** A git host's token can
+    no longer reach a different host. A `-` in a host name is now `__` in
+    its token variable (`my-gitlab.example` → `UVR_GITLAB_TOKEN_MY__GITLAB_EXAMPLE`).
+    Before, `-` and `.` were both `_`, so a project that named
+    `git-corp.com` received the token set for `git.corp.com`. The all-hosts
+    `UVR_GITLAB_TOKEN` and `UVR_FORGEJO_TOKEN` now go only to `gitlab.com`
+    and `codeberg.org`; before, they went to any host a dependency named. A
+    variable under its old name, or an all-hosts token that a host no
+    longer gets, produces a warning with the variable to set instead.
+  - The first `uvr add` in a project writes a standard `[dependencies]`
+    table, not an inline `dependencies = { … }` above `[project]`.
+  - A CRLF `uvr.toml` stays CRLF when `uvr add` or `uvr remove` edits it.
+
+- **Positron settings name the project's R** (#321). `uvr init`, `sync` and
+  `import` now bind `.vscode/settings.json` to the R that `uvr run` resolves
+  (the `.r-version` pin, then the `uvr.toml` `r_version`) instead of the
+  newest installed R. If no installed R satisfies the project, the settings
+  are left alone with a hint, rather than pointing at a different R. The
+  managed-R check also honours `UVR_R_INSTALL_DIR` now.
 
 - **IDE config is now opt-in; CI mode is explicit** (#176, #206).
   `uvr init`/`sync`/`import` no longer assume an RStudio/Positron workflow:
@@ -72,7 +380,6 @@ Pure tracking section — fixes and small features land here between tags.
   Credentials never show in output, `-v` included, and `user:pass@` URLs are
   redacted. `uvr add --source` now refuses a URL that has credentials in it.
 - Verify installed and cached URL tarball package provenance before reuse, including same-version content or origin changes. Downloads are verified against the locked checksum; frozen sync checks the declared URL locally.
-
 
 - **Depend on a source tarball by URL** (#189). `uvr add
   https://…/pkg_1.2.0.tar.gz` records `pkg = { url = "…" }` in `uvr.toml`;

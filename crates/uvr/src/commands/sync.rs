@@ -4,9 +4,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use uvr_core::installer::binary_install::{
-    inspect_tarball, install_binary_package, patch_installed_so_files,
+    inspect_tarball, install_binary_package, patch_installed_so_files, TarballMeta,
 };
 use uvr_core::installer::download::{DownloadSpec, Downloader};
+use uvr_core::installer::install_marker;
 use uvr_core::installer::nested_source::{self, NestedProvenance};
 use uvr_core::installer::package_cache;
 use uvr_core::installer::r_cmd_install::RCmdInstall;
@@ -23,10 +24,11 @@ use crate::ui::palette;
 
 /// Per-package install plan resolved at sync time.
 ///
-/// `is_binary` determines whether `install_binary_package` is used (vs.
-/// `R CMD INSTALL`). `fallback_url` is consulted by the downloader when
-/// the primary URL fails — typically the binary URL falls back to the
-/// source URL recorded in the lockfile.
+/// `is_binary` marks a binary URL; `classify_download` makes the final
+/// `install_binary_package` vs. `R CMD INSTALL` call once the bytes are on
+/// disk, since a binary URL can serve source (#225). `fallback_url` is
+/// consulted by the downloader when the primary URL fails — typically the
+/// binary URL falls back to the source URL recorded in the lockfile.
 struct PkgPlan<'a> {
     pkg: &'a LockedPackage,
     url: String,
@@ -85,20 +87,43 @@ fn install_kind_from_metadata(
     if is_repository_archive(pkg) {
         return InstallKind::Source;
     }
-    if used_binary {
-        return InstallKind::Binary;
-    }
+    classify_download(used_binary, meta.as_ref(), host, r_minor)
+}
+
+/// Pure function: decide how to install one downloaded archive from its
+/// inspected DESCRIPTION (`None` when none could be read) and whether it came
+/// from a binary URL.
+///
+/// A binary URL is trusted unless DESCRIPTION has no `Built:` field at all.
+/// That is proof of a source tarball: P3M's Linux repos serve source at the
+/// binary URL for any package version not built for that repo yet (#225).
+/// Every other binary-URL case stays `Binary` on purpose — Windows zips
+/// (`None`), a `Built:` for another host, an unreadable DESCRIPTION — and
+/// `verify_built_package` still guards a truncated archive.
+fn classify_download(
+    used_binary: bool,
+    meta: Option<&TarballMeta>,
+    host: &uvr_core::r_version::downloader::HostTriple,
+    r_minor: &str,
+) -> InstallKind {
     match meta {
-        Some(meta)
-            if meta
+        Some(m) if m.has_built_field || m.built.is_some() => {
+            let host_matches = m
                 .built
                 .as_ref()
-                .is_some_and(|built| built.matches_host(host, r_minor)) =>
-        {
-            InstallKind::Binary
+                .is_some_and(|b| b.matches_host(host, r_minor));
+            if used_binary || host_matches {
+                InstallKind::Binary
+            } else if m.pure_r {
+                InstallKind::PureR
+            } else {
+                InstallKind::Source
+            }
         }
-        Some(meta) if meta.pure_r => InstallKind::PureR,
-        _ => InstallKind::Source,
+        Some(m) if m.pure_r => InstallKind::PureR,
+        Some(_) => InstallKind::Source,
+        None if used_binary => InstallKind::Binary,
+        None => InstallKind::Source,
     }
 }
 
@@ -203,6 +228,7 @@ pub async fn run(
     library: Option<PathBuf>,
     timeout: Option<Duration>,
     ide: Ide,
+    prune_all: bool,
 ) -> Result<()> {
     let project = Project::find_cwd().context("Not inside a uvr project")?;
     // CLI --library takes precedence, then UVR_LIBRARY env var.
@@ -215,6 +241,7 @@ pub async fn run(
         library.as_deref(),
         timeout,
         ide,
+        prune_all,
     )
     .await
 }
@@ -227,6 +254,10 @@ pub async fn run(
 /// With `frozen = true` (CI mode): first verify that the lockfile is consistent
 /// with the current manifest. If the manifest has diverged, exit with an error
 /// rather than silently installing a stale environment.
+///
+/// `prune_all` (`--prune-all`) also removes unlocked packages uvr did not
+/// install (#255).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_inner(
     project: &Project,
     frozen: bool,
@@ -235,6 +266,7 @@ pub async fn run_inner(
     library_override: Option<&std::path::Path>,
     timeout: Option<Duration>,
     ide: Ide,
+    prune_all: bool,
 ) -> Result<()> {
     let lockfile = project
         .load_lockfile()
@@ -269,8 +301,11 @@ pub async fn run_inner(
 
         // Write .vscode/settings.json only when targeting Positron.
         if ide.is_positron() {
-            crate::commands::init::ensure_positron_settings(&project.root)
-                .context("Failed to write Positron settings")?;
+            crate::commands::init::ensure_positron_settings(
+                &project.root,
+                project.manifest.project.r_version.as_deref(),
+            )
+            .context("Failed to write Positron settings")?;
         }
 
         // Add uvr entries to .Rbuildignore only when DESCRIPTION has `Package:`
@@ -347,7 +382,11 @@ pub async fn run_inner(
         r_info,
         // Only `uvr sync` prunes: it is the command the `uvr remove` hint
         // names, and the one whose contract is "make the library match".
-        true,
+        if prune_all {
+            Prune::All
+        } else {
+            Prune::UvrInstalled
+        },
     )
     .await
 }
@@ -384,9 +423,21 @@ pub async fn install_from_lockfile(
         library_override,
         timeout,
         r_info,
-        false,
+        Prune::Off,
     )
     .await
+}
+
+/// Which unlocked packages a successful install removes from the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prune {
+    /// `add`/`import`/`update`/`run`: purely additive.
+    Off,
+    /// `uvr sync`: only packages uvr installed (#255). Anything else in the
+    /// library was put there by the user or another tool.
+    UvrInstalled,
+    /// `uvr sync --prune-all`: every package directory.
+    All,
 }
 
 /// [`install_from_lockfile`] with the R detection already done — `uvr sync`
@@ -401,7 +452,7 @@ async fn install_from_lockfile_with_r(
     library_override: Option<&std::path::Path>,
     timeout: Option<Duration>,
     r_info: Option<(PathBuf, String)>,
-    prune: bool,
+    prune: Prune,
 ) -> Result<()> {
     validate_lock_identity(lockfile)?;
 
@@ -550,7 +601,8 @@ async fn install_from_lockfile_with_r(
     // may point at shared or system libraries that hold packages other
     // projects depend on). Deferred until after a successful install so a
     // failed sync remains a no-op on the library.
-    let do_prune = prune && library_override.is_none();
+    let do_prune = prune != Prune::Off && library_override.is_none();
+    let prune_all = prune == Prune::All;
 
     let all_ordered = topological_install_order(&lockfile.packages)
         .context("Failed to determine install order")?;
@@ -574,7 +626,7 @@ async fn install_from_lockfile_with_r(
 
     if to_install.is_empty() {
         if do_prune {
-            prune_unused_packages(&library, lockfile);
+            prune_unused_packages(&library, lockfile, prune_all);
         }
         if let Some((_, ref current_r)) = r_info {
             write_library_r_sentinel(&library, &r_minor(current_r));
@@ -816,6 +868,8 @@ async fn install_from_lockfile_with_r(
                             platform,
                             bioc_release,
                             slug.as_deref(),
+                            // A dated lock installs from the same snapshot (#194).
+                            lockfile.r.resolved_as_of.as_deref(),
                         )
                         .await,
                     )
@@ -919,18 +973,29 @@ async fn install_from_lockfile_with_r(
             .iter()
             .zip(results.iter())
             .map(|(plan, result)| {
-                let meta = if !is_repository_archive(plan.pkg) && !result.used_binary {
-                    inspect_tarball(&result.path, &plan.pkg.name)
-                } else {
+                // Inspect a binary-URL download too: P3M can serve a source
+                // tarball there (#225).
+                let meta = if is_repository_archive(plan.pkg) {
                     None
+                } else {
+                    inspect_tarball(&result.path, &plan.pkg.name)
                 };
-                install_kind_from_metadata(
+                let kind = install_kind_from_metadata(
                     plan.pkg,
                     result.used_binary,
                     meta,
                     &host_info.triple,
                     &r_minor_str,
-                )
+                );
+                if result.used_binary && kind != InstallKind::Binary {
+                    // Same shape as the downloader's 404-fallback line.
+                    tracing::info!(
+                        "{} {}: binary URL served a source tarball, installing from source",
+                        plan.pkg.name,
+                        plan.pkg.version
+                    );
+                }
+                kind
             })
             .collect();
 
@@ -1004,11 +1069,12 @@ async fn install_from_lockfile_with_r(
         // "No binary repo" hint — only fires when no packages were binary and at
         // least one real source build (compilation) is needed. Pure-R alone doesn't
         // indicate "no binaries available" — those packages simply have no binary form.
-        if runtime_binary == 0 && runtime_source > 0 && !plans.is_empty() {
-            println!(
+        // A binary plan means a repo exists; it just served source (#225).
+        if runtime_binary == 0 && runtime_source > 0 && !plans.iter().any(|p| p.is_binary) {
+            ui::line(format!(
                 "  i  No binary repo for {} on R {}; compiling {} package(s) from source.",
                 host_info.distro_label, r_minor_str, runtime_source
-            );
+            ));
         }
 
         // Check for missing system dependencies: the tarballs are on disk
@@ -1040,7 +1106,10 @@ async fn install_from_lockfile_with_r(
                     .collect();
 
                 if !queries.is_empty() {
-                    let check = sysreqs::check_system_deps(&client, &queries, &distro).await;
+                    let check = sysreqs::check_system_deps(&client, &queries, &distro).await?;
+                    for description in &check.overrides_applied {
+                        ui::info_err(format!("System dependency override: {description}"));
+                    }
 
                     // #30 follow-up: only fire the unsupported-distro warning
                     // when at least one package actually declares
@@ -1425,7 +1494,7 @@ async fn install_from_lockfile_with_r(
     // Install succeeded — now (and only now) drop unused packages, so a
     // failed sync never leaves the library smaller than it started.
     if do_prune {
-        prune_unused_packages(&library, lockfile);
+        prune_unused_packages(&library, lockfile, prune_all);
     }
 
     let sep = format!(" {} ", ui::glyph::bullet());
@@ -1442,6 +1511,13 @@ async fn install_from_lockfile_with_r(
 /// making the library match the resolution (what `uvr remove`'s "run
 /// `uvr sync` to remove unused packages" hint has always promised).
 ///
+/// Only packages uvr installed are removed (#255): the library is on
+/// `R_LIBS_USER` in an activated shell, so `install.packages()` and other
+/// tools install there too. The rest are kept and listed once, unless
+/// `prune_all` (`--prune-all`) asks for the old remove-everything behaviour.
+/// Locked packages are uvr's by definition, so they are marked here as well,
+/// which adopts libraries installed before the marker existed.
+///
 /// Guards: only real package dirs (with a DESCRIPTION) are candidates; the
 /// uvr companion package and non-package files (e.g. the `.uvr-r-version`
 /// sentinel) are skipped. Linux libraries hold symlinks into the global
@@ -1449,21 +1525,34 @@ async fn install_from_lockfile_with_r(
 /// to the project's own `.uvr/library/` (never `--library`/`UVR_LIBRARY`
 /// targets, which may be shared) and to explicit `uvr sync` runs.
 ///
-/// Returns the number of packages removed.
-fn prune_unused_packages(library: &std::path::Path, lockfile: &Lockfile) -> usize {
+/// Returns the number of packages removed and the names of the packages kept
+/// because uvr did not install them.
+fn prune_unused_packages(
+    library: &std::path::Path,
+    lockfile: &Lockfile,
+    prune_all: bool,
+) -> (usize, Vec<String>) {
     let locked_names: std::collections::HashSet<&str> =
         lockfile.packages.iter().map(|p| p.name.as_str()).collect();
     let mut removed_unused = 0usize;
+    let mut kept = Vec::new();
     if let Ok(entries) = std::fs::read_dir(library) {
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let Some(name) = file_name.to_str() else {
                 continue;
             };
-            if name == "uvr" || locked_names.contains(name) {
+            // The companion is installed (and marked) by uvr but is never in
+            // uvr.lock, so it needs its own exemption in both modes.
+            if name == "uvr" || !entry.path().join("DESCRIPTION").exists() {
                 continue;
             }
-            if !entry.path().join("DESCRIPTION").exists() {
+            if locked_names.contains(name) {
+                install_marker::mark(&entry.path());
+                continue;
+            }
+            if !prune_all && !install_marker::is_marked(&entry.path()) {
+                kept.push(name.to_string());
                 continue;
             }
             let version = installed_version(name, library);
@@ -1489,7 +1578,16 @@ fn prune_unused_packages(library: &std::path::Path, lockfile: &Lockfile) -> usiz
             "Removed {removed_unused} unused package(s) from the library"
         ));
     }
-    removed_unused
+    if !kept.is_empty() {
+        kept.sort();
+        ui::bullet_dim(format!(
+            "Kept {} unmanaged package(s) not in uvr.lock: {} \
+             (`uvr sync --prune-all` removes them)",
+            kept.len(),
+            kept.join(", ")
+        ));
+    }
+    (removed_unused, kept)
 }
 
 /// Pinned commit SHA and expected SHA-256 hash of the companion R package tarball.
@@ -1754,6 +1852,30 @@ pub(super) fn validate_frozen_lock(project: &Project, lockfile: &Lockfile) -> Re
     }
     validate_locked_manifest(project, lockfile)?;
 
+    // The fingerprint covers `[resolution] exclude-newer`. When uvr.toml
+    // names a date, a lock made at another date (or live) is out of date
+    // (#194). When it names none, a dated lock came from `uvr lock
+    // --exclude-newer` and is current, as a `--resolution` lock is. The
+    // manifest date is normalized as `uvr lock` does it; a date with no
+    // snapshot is an error here too.
+    let wanted = project
+        .manifest
+        .exclude_newer()
+        .map(uvr_core::registry::cran::snapshot_date)
+        .transpose()?;
+    if wanted.is_some() && lockfile.r.resolved_as_of != wanted {
+        let describe = |date: Option<&str>| match date {
+            Some(date) => format!("as of {date}"),
+            None => "without a date limit".to_string(),
+        };
+        anyhow::bail!(
+            "uvr.lock was resolved {}, but uvr.toml asks for a resolution {}.\n\
+             Run `uvr lock` to update it, then commit the result.",
+            describe(lockfile.r.resolved_as_of.as_deref()),
+            describe(wanted.as_deref())
+        );
+    }
+
     // The manifest fingerprint covers the R constraint, while the lock also
     // records the concrete R minor used to resolve binary/Bioc packages.
     if let Ok(r_binary) = find_r_binary(project.manifest.project.r_version.as_deref()) {
@@ -1803,8 +1925,8 @@ fn validate_locked_manifest(project: &Project, lockfile: &Lockfile) -> Result<()
     }
     if let Some(req) = manifest.project.r_version.as_deref() {
         if looks_like_version(&lockfile.r.version) {
-            let version = semver::Version::parse(&normalize_version(&lockfile.r.version))?;
-            if !version_matches_req(&version, &parse_version_req(req)?) {
+            // Same reading of a bare version as R selection (#320).
+            if !uvr_core::r_version::detector::r_version_satisfies(req, &lockfile.r.version)? {
                 anyhow::bail!(
                     "Locked R {} does not satisfy {req}; run `uvr lock`",
                     lockfile.r.version
@@ -1831,7 +1953,17 @@ fn validate_locked_manifest(project: &Project, lockfile: &Lockfile) -> Result<()
         let pkg = lockfile.get_package(name).ok_or_else(|| {
             anyhow::anyhow!("uvr.lock does not contain manifest dependency {name}")
         })?;
-        if let Some(req) = spec.version_req().filter(|s| !s.is_empty() && *s != "*") {
+        // An override replaces every requirement on the package, the
+        // manifest's own included (#195), so the lock must hold its version.
+        if let Some(forced) = manifest.override_dependencies.get(name) {
+            if normalize_version(&pkg.version) != normalize_version(forced) {
+                anyhow::bail!(
+                    "Locked {} {} is not the override version {forced}; run `uvr lock`",
+                    name,
+                    pkg.version
+                );
+            }
+        } else if let Some(req) = spec.version_req().filter(|s| !s.is_empty() && *s != "*") {
             let version = semver::Version::parse(&normalize_version(&pkg.version))?;
             if !version_matches_req(&version, &parse_version_req(req)?) {
                 anyhow::bail!("Locked {} {} does not satisfy {req}", name, pkg.version);
@@ -1849,8 +1981,13 @@ fn validate_locked_manifest(project: &Project, lockfile: &Lockfile) -> Result<()
             anyhow::bail!("Locked URL source for {name} is not declared in the manifest");
         }
         if let Some(git) = spec.git() {
-            let matching_provider = if let Some(url) = git.strip_prefix("git::") {
-                matches!(&pkg.source, uvr_core::lockfile::PackageSource::Git { url: locked } if locked == url)
+            let matching_provider = if git.starts_with("git::") {
+                // The lock records the clone URL without the `@ref` that
+                // `git = "git::<url>@<ref>"` may carry inline.
+                let url = uvr_core::registry::git_generic::manifest_spec(git, None)
+                    .map_err(|e| anyhow::anyhow!("Invalid git dependency for {name}: {e}"))?
+                    .url;
+                matches!(&pkg.source, uvr_core::lockfile::PackageSource::Git { url: locked } if *locked == url)
             } else if git.starts_with("forgejo::") {
                 matches!(
                     pkg.source,
@@ -2639,6 +2776,7 @@ mod tests {
             r: RVersionPin {
                 version: "*".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![locked_pkg(
                 "rlang",
@@ -2660,6 +2798,54 @@ mod tests {
     }
 
     #[test]
+    fn frozen_lock_date_must_match_a_manifest_date() {
+        // #194: a lock dated by `uvr lock --exclude-newer` is current while
+        // uvr.toml names no date, as a `--resolution` lock is. Once uvr.toml
+        // names one, the lock must have been resolved at that date.
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut manifest = uvr_core::manifest::Manifest::new("research", None);
+        manifest.add_dep(
+            "rlang".into(),
+            uvr_core::manifest::DependencySpec::Version("*".into()),
+            false,
+        );
+        let check = |manifest: &uvr_core::manifest::Manifest, as_of: Option<&str>| {
+            // A new file each time: `write` keeps an existing uvr.toml's
+            // `[resolution]`, which no command edits.
+            let path = temp.path().join("uvr.toml");
+            let _ = std::fs::remove_file(&path);
+            manifest.write(&path).unwrap();
+            let project = Project::find(temp.path()).unwrap();
+            let lock = Lockfile {
+                manifest_fingerprint: Some(manifest.lock_fingerprint().unwrap()),
+                r: RVersionPin {
+                    version: "*".into(),
+                    bioc_version: None,
+                    resolved_as_of: as_of.map(str::to_string),
+                },
+                packages: vec![locked_pkg(
+                    "rlang",
+                    "1.1.6",
+                    "https://cran.example/rlang.tar.gz",
+                )],
+            };
+            validate_frozen_lock(&project, &lock)
+        };
+        check(&manifest, None).unwrap();
+        check(&manifest, Some("2024-01-01")).unwrap();
+
+        manifest.resolution = Some(uvr_core::manifest::ResolutionConfig {
+            exclude_newer: Some("2024-01-01".into()),
+            ..Default::default()
+        });
+        check(&manifest, Some("2024-01-01")).unwrap();
+        for other in [None, Some("2023-06-01")] {
+            let err = check(&manifest, other).unwrap_err();
+            assert!(err.to_string().contains("as of 2024-01-01"), "{err}");
+        }
+    }
+
+    #[test]
     fn legacy_frozen_lock_checks_roots_without_network() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("uvr.toml");
@@ -2676,6 +2862,7 @@ mod tests {
             r: RVersionPin {
                 version: "*".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![locked_pkg(
                 "rlang",
@@ -2705,6 +2892,7 @@ mod tests {
             r: RVersionPin {
                 version: "*".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![locked_pkg(
                 "rlang",
@@ -2720,6 +2908,46 @@ mod tests {
         lock.packages[0].dev = false;
         lock.packages.push(lock.packages[0].clone());
         assert!(validate_frozen_lock(&project, &lock).is_err());
+    }
+
+    #[test]
+    fn frozen_lock_accepts_an_inline_git_ref() {
+        // The lock records the clone URL without the `@ref` that
+        // `git = "git::<url>@<ref>"` carries inline.
+        for (git, rev) in [
+            ("git::https://example.org/demo.git@v1", None),
+            ("git::https://example.org/demo.git", Some("v1")),
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let mut manifest = uvr_core::manifest::Manifest::new("test", None);
+            manifest.add_dep(
+                "demo".into(),
+                uvr_core::manifest::DependencySpec::Detailed(uvr_core::manifest::DetailedDep {
+                    git: Some(git.into()),
+                    rev: rev.map(Into::into),
+                    ..Default::default()
+                }),
+                false,
+            );
+            manifest.write(&temp.path().join("uvr.toml")).unwrap();
+            let project = Project::find(temp.path()).unwrap();
+            let mut pkg = locked_pkg("demo", "1.0.0", "https://example.org/demo.git");
+            pkg.url = None;
+            pkg.source = PackageSource::Git {
+                url: "https://example.org/demo.git".into(),
+            };
+            pkg.checksum = Some(format!("git:{}", "a".repeat(40)));
+            let lock = Lockfile {
+                manifest_fingerprint: Some(manifest.lock_fingerprint().unwrap()),
+                r: RVersionPin {
+                    version: "*".into(),
+                    bioc_version: None,
+                    resolved_as_of: None,
+                },
+                packages: vec![pkg],
+            };
+            validate_frozen_lock(&project, &lock).unwrap_or_else(|e| panic!("{git}: {e}"));
+        }
     }
 
     #[test]
@@ -2748,6 +2976,7 @@ mod tests {
             r: RVersionPin {
                 version: "*".into(),
                 bioc_version: Some("3.21".into()),
+                resolved_as_of: None,
             },
             packages: vec![pkg],
         };
@@ -2774,6 +3003,7 @@ mod tests {
             r: RVersionPin {
                 version: "*".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![nested_locked("rlang", NESTED_SHA, None)],
         };
@@ -2956,7 +3186,153 @@ mod tests {
     }
 
     use uvr_core::r_version::downloader::HostTriple;
-    use uvr_core::registry::cran::{parse_packages_gz, CranRegistry};
+    use uvr_core::registry::cran::{parse_built, parse_packages_gz, CranRegistry};
+
+    /// DESCRIPTION metadata as `inspect_tarball` reports it; `built` is the
+    /// raw `Built:` value, `None` for a line that is absent.
+    fn meta(built: Option<&str>, pure_r: bool) -> TarballMeta {
+        TarballMeta {
+            built: built.and_then(parse_built),
+            has_built_field: built.is_some(),
+            pure_r,
+            ..Default::default()
+        }
+    }
+
+    const MUSL_BUILT: &str = "R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix";
+    const GNU_BUILT: &str = "R 4.5.0; x86_64-pc-linux-gnu; 2025-01-15; unix";
+
+    #[test]
+    fn classify_binary_url_source_tarball_builds_from_source() {
+        // #225: P3M served xml2's source tarball at the binary URL.
+        let host = musl_host();
+        let src = meta(None, false);
+        assert_eq!(
+            classify_download(true, Some(&src), &host, "4.5"),
+            InstallKind::Source
+        );
+        let pure = meta(None, true);
+        assert_eq!(
+            classify_download(true, Some(&pure), &host, "4.5"),
+            InstallKind::PureR
+        );
+    }
+
+    #[test]
+    fn classify_binary_url_keeps_binary_unless_built_is_absent() {
+        let host = musl_host();
+        // Built: for this host, for another host, and one uvr can't parse:
+        // none of them proves source, so a binary URL stays binary.
+        for built in [MUSL_BUILT, GNU_BUILT, "garbage"] {
+            let m = meta(Some(built), true);
+            assert_eq!(
+                classify_download(true, Some(&m), &host, "4.5"),
+                InstallKind::Binary,
+                "{built}"
+            );
+        }
+        // No DESCRIPTION found (a Windows zip, an odd layout).
+        assert_eq!(
+            classify_download(true, None, &host, "4.5"),
+            InstallKind::Binary
+        );
+    }
+
+    #[test]
+    fn classify_source_url_sniffs_for_a_host_binary() {
+        let host = musl_host();
+        let own = meta(Some(MUSL_BUILT), false);
+        assert_eq!(
+            classify_download(false, Some(&own), &host, "4.5"),
+            InstallKind::Binary
+        );
+        let other = meta(Some(GNU_BUILT), true);
+        assert_eq!(
+            classify_download(false, Some(&other), &host, "4.5"),
+            InstallKind::PureR
+        );
+        assert_eq!(
+            classify_download(false, None, &host, "4.5"),
+            InstallKind::Source
+        );
+    }
+
+    /// A real `<pkg>.tar.gz` laid out the way `R CMD build` does, with
+    /// DESCRIPTION not the first entry.
+    fn write_pkg_tarball(dir: &std::path::Path, pkg: &str, description: &[u8]) -> PathBuf {
+        let path = dir.join(format!("{pkg}.tar.gz"));
+        let mut enc = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(),
+            flate2::Compression::default(),
+        );
+        {
+            let mut builder = tar::Builder::new(&mut enc);
+            for (name, body) in [
+                (format!("{pkg}/src/init.c"), &b"int x;\n"[..]),
+                (format!("{pkg}/DESCRIPTION"), description),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_path(name).unwrap();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                builder.append(&h, body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        enc.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn classify_real_source_tarball_from_binary_url() {
+        // End to end through `inspect_tarball`, no `Built:` line.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_pkg_tarball(
+            dir.path(),
+            "xml2",
+            b"Package: xml2\nVersion: 1.6.0\nNeedsCompilation: yes\n\
+              SystemRequirements: libxml2: libxml2-dev (deb)\n",
+        );
+        let m = inspect_tarball(&path, "xml2").unwrap();
+        assert_eq!(
+            classify_download(true, Some(&m), &musl_host(), "4.5"),
+            InstallKind::Source
+        );
+        // The sysreqs pre-check reads the same tarball, so the re-routed
+        // build is still checked for libxml2.
+        assert!(m.system_requirements.unwrap().contains("libxml2"));
+    }
+
+    #[test]
+    fn classify_real_latin1_tarballs() {
+        // A latin1 byte in DESCRIPTION must not hide `Built:` and send a
+        // real binary to a source build, nor turn source into binary.
+        let dir = tempfile::TempDir::new().unwrap();
+        let host = musl_host();
+        let bin = write_pkg_tarball(
+            dir.path(),
+            "bin",
+            b"Package: bin\nAuthor: Fran\xe7ois\nNeedsCompilation: yes\n\
+              Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix\n",
+        );
+        let m = inspect_tarball(&bin, "bin").unwrap();
+        assert!(m.has_built_field);
+        assert_eq!(
+            classify_download(true, Some(&m), &host, "4.5"),
+            InstallKind::Binary
+        );
+        let src = write_pkg_tarball(
+            dir.path(),
+            "src",
+            b"Package: src\nAuthor: Fran\xe7ois\nNeedsCompilation: yes\n",
+        );
+        let m = inspect_tarball(&src, "src").unwrap();
+        assert_eq!(
+            classify_download(true, Some(&m), &host, "4.5"),
+            InstallKind::Source
+        );
+    }
 
     fn musl_host() -> HostTriple {
         HostTriple {
@@ -2988,35 +3364,101 @@ mod tests {
         }
     }
 
-    #[test]
-    fn prune_removes_only_packages_absent_from_lockfile() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        fake_installed_pkg(tmp.path(), "keepme", "1.0");
-        fake_installed_pkg(tmp.path(), "dropme", "2.0");
+    fn fake_uvr_installed_pkg(library: &std::path::Path, name: &str, version: &str) {
+        fake_installed_pkg(library, name, version);
+        install_marker::write_marker(&library.join(name)).unwrap();
+    }
 
-        let removed = prune_unused_packages(tmp.path(), &lockfile_with(&["keepme"]));
+    #[test]
+    fn prune_removes_only_uvr_installed_packages_absent_from_lockfile() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_uvr_installed_pkg(tmp.path(), "keepme", "1.0");
+        fake_uvr_installed_pkg(tmp.path(), "dropme", "2.0");
+
+        let (removed, kept) = prune_unused_packages(tmp.path(), &lockfile_with(&["keepme"]), false);
 
         assert_eq!(removed, 1);
+        assert!(kept.is_empty());
         assert!(tmp.path().join("keepme").exists());
         assert!(!tmp.path().join("dropme").exists());
     }
 
     #[test]
+    fn prune_keeps_and_reports_packages_uvr_did_not_install() {
+        // #255: `install.packages()` in an activated shell, or carrier,
+        // installs into the project library without a uvr marker.
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_installed_pkg(tmp.path(), "zeta", "1.0");
+        fake_installed_pkg(tmp.path(), "carrier", "0.1");
+        fake_uvr_installed_pkg(tmp.path(), "dropme", "2.0");
+
+        let (removed, kept) = prune_unused_packages(tmp.path(), &lockfile_with(&[]), false);
+
+        assert_eq!(removed, 1);
+        assert_eq!(kept, ["carrier", "zeta"], "listed once, sorted");
+        assert!(tmp.path().join("zeta").exists());
+        assert!(tmp.path().join("carrier").exists());
+        assert!(!tmp.path().join("dropme").exists());
+    }
+
+    #[test]
+    fn prune_all_removes_packages_uvr_did_not_install() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_installed_pkg(tmp.path(), "foreign", "1.0");
+        fake_uvr_installed_pkg(tmp.path(), "dropme", "2.0");
+        fake_installed_pkg(tmp.path(), "keepme", "1.0");
+
+        let (removed, kept) = prune_unused_packages(tmp.path(), &lockfile_with(&["keepme"]), true);
+
+        assert_eq!(removed, 2);
+        assert!(kept.is_empty());
+        assert!(!tmp.path().join("foreign").exists());
+        assert!(!tmp.path().join("dropme").exists());
+        assert!(tmp.path().join("keepme").exists());
+    }
+
+    #[test]
+    fn prune_adopts_locked_packages_installed_before_the_marker() {
+        // A library from before #255 has no markers. What uvr.lock lists is
+        // uvr's, so sync stamps it even though nothing is reinstalled...
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_installed_pkg(tmp.path(), "foo", "1.0");
+        fake_installed_pkg(tmp.path(), "bar", "1.0");
+
+        let (removed, _) =
+            prune_unused_packages(tmp.path(), &lockfile_with(&["foo", "bar"]), false);
+        assert_eq!(removed, 0);
+        assert!(install_marker::is_marked(&tmp.path().join("foo")));
+        assert!(install_marker::is_marked(&tmp.path().join("bar")));
+
+        // ...so a later `uvr remove foo && uvr sync` does remove it.
+        let (removed, kept) = prune_unused_packages(tmp.path(), &lockfile_with(&["bar"]), false);
+        assert_eq!(removed, 1);
+        assert!(kept.is_empty());
+        assert!(!tmp.path().join("foo").exists());
+        assert!(tmp.path().join("bar").exists());
+    }
+
+    #[test]
     fn prune_spares_companion_sentinel_and_non_packages() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // The companion package is uvr-managed, never lockfile-tracked.
-        fake_installed_pkg(tmp.path(), "uvr", "0.1.4");
+        // The companion package is uvr-installed (so marked), never
+        // lockfile-tracked.
+        fake_uvr_installed_pkg(tmp.path(), "uvr", "0.1.4");
         // The sentinel is a flat file; a stray dir without DESCRIPTION is
         // not a package — neither may be touched.
         std::fs::write(tmp.path().join(".uvr-r-version"), "4.5").unwrap();
         std::fs::create_dir(tmp.path().join("not-a-package")).unwrap();
 
-        let removed = prune_unused_packages(tmp.path(), &lockfile_with(&[]));
+        for prune_all in [false, true] {
+            let (removed, kept) = prune_unused_packages(tmp.path(), &lockfile_with(&[]), prune_all);
 
-        assert_eq!(removed, 0);
-        assert!(tmp.path().join("uvr").exists());
-        assert!(tmp.path().join(".uvr-r-version").exists());
-        assert!(tmp.path().join("not-a-package").exists());
+            assert_eq!(removed, 0);
+            assert!(kept.is_empty());
+            assert!(tmp.path().join("uvr").exists());
+            assert!(tmp.path().join(".uvr-r-version").exists());
+            assert!(tmp.path().join("not-a-package").exists());
+        }
     }
 
     #[cfg(unix)]
@@ -3025,15 +3467,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // Simulate the Linux layout: the library entry is a symlink into
         // the global package cache. Pruning must remove the link and leave
-        // the cache target untouched.
+        // the cache target untouched. The marker is read through the link.
         let cache = tmp.path().join("cache-entry");
-        fake_installed_pkg(&tmp.path().join("."), "unused", "1.0");
+        fake_uvr_installed_pkg(&tmp.path().join("."), "unused", "1.0");
         std::fs::rename(tmp.path().join("unused"), &cache).unwrap();
         let library = tmp.path().join("library");
         std::fs::create_dir(&library).unwrap();
         std::os::unix::fs::symlink(&cache, library.join("unused")).unwrap();
 
-        let removed = prune_unused_packages(&library, &lockfile_with(&[]));
+        let (removed, _) = prune_unused_packages(&library, &lockfile_with(&[]), false);
 
         assert_eq!(removed, 1);
         assert!(!library.join("unused").exists());
@@ -3411,6 +3853,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
             r: RVersionPin {
                 version: "4.4.2".into(),
                 bioc_version: None,
+                resolved_as_of: None,
             },
             packages: vec![
                 locked_pkg(
@@ -3475,6 +3918,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
                 r: RVersionPin {
                     version: "4.4.2".into(),
                     bioc_version: None,
+                    resolved_as_of: None,
                 },
                 packages: vec![broken],
             })
@@ -3489,6 +3933,7 @@ Built: R 4.5.0; x86_64-pc-linux-musl; 2025-01-15; unix
             Some(&external_library),
             None,
             Ide::None,
+            false,
         )
         .await;
         assert!(result.is_err());

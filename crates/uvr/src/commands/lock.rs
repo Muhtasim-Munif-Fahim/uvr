@@ -3,11 +3,11 @@ use std::collections::{HashMap, VecDeque};
 use anyhow::{Context, Result};
 
 use uvr_core::lockfile::{Lockfile, PackageSource};
-use uvr_core::manifest::DependencySpec;
+use uvr_core::manifest::{DependencySpec, ResolutionStrategy};
 use uvr_core::project::Project;
-use uvr_core::r_version::detector::{find_r_binary, query_r_version};
+use uvr_core::r_version::detector::{find_r_binary, query_r_base_packages, query_r_version};
 use uvr_core::registry::bioconductor::BiocRegistry;
-use uvr_core::registry::cran::CranRegistry;
+use uvr_core::registry::cran::{snapshot_date, CranRegistry};
 use uvr_core::registry::forgejo::{
     fetch_commit_sha as fetch_forgejo_commit_sha, parse_forgejo_spec,
     resolve_forgejo_package_with_remote_entries_and_install_dependencies_at_commit_bound,
@@ -28,14 +28,22 @@ use crate::ui;
 
 use super::util::{build_client, make_spinner};
 
-pub async fn run(upgrade: bool) -> Result<()> {
+pub async fn run(
+    upgrade: bool,
+    strategy: Option<ResolutionStrategy>,
+    exclude_newer: Option<String>,
+) -> Result<()> {
     let project = Project::find_cwd().context("Not inside a uvr project")?;
     let start = ui::now();
-    let lockfile = resolve_and_lock(&project, upgrade).await?;
+    let lockfile = lock_and_write(&project, upgrade, strategy, exclude_newer.as_deref()).await?;
+    let as_of = match &lockfile.r.resolved_as_of {
+        Some(date) => format!(", CRAN as of {date}"),
+        None => String::new(),
+    };
     ui::summary(
         format!("Lockfile updated — {} package(s)", lockfile.packages.len()),
         format!(
-            "resolved in {}",
+            "resolved in {}{as_of}",
             ui::palette::format_duration(start.elapsed())
         ),
     );
@@ -45,8 +53,31 @@ pub async fn run(upgrade: bool) -> Result<()> {
 /// Re-resolve all dependencies and write `uvr.lock`.
 /// Called by `uvr lock`, `uvr add`, and `uvr remove`.
 pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfile> {
+    resolve_and_lock_with(project, upgrade, None).await
+}
+
+/// `resolve_and_lock` with a `--resolution` override; `None` uses the
+/// manifest's `[resolution] strategy`.
+pub async fn resolve_and_lock_with(
+    project: &Project,
+    upgrade: bool,
+    strategy: Option<ResolutionStrategy>,
+) -> Result<Lockfile> {
+    lock_and_write(project, upgrade, strategy, None).await
+}
+
+/// `resolve_and_lock_with` plus an `--exclude-newer` override; `None` uses
+/// the manifest's `[resolution] exclude-newer`.
+async fn lock_and_write(
+    project: &Project,
+    upgrade: bool,
+    strategy: Option<ResolutionStrategy>,
+    exclude_newer: Option<&str>,
+) -> Result<Lockfile> {
     let existing = load_existing_lockfile(project);
-    if !upgrade {
+    // A `--resolution` or `--exclude-newer` override asks for a different
+    // resolution of the same inputs, so it never reuses the lock.
+    if !upgrade && strategy.is_none() && exclude_newer.is_none() {
         if let Some(mut locked) = existing.clone() {
             // Reuse the whole resolution only when its inputs still match.
             // Individual pins lose dependency constraints in legacy locks and
@@ -61,9 +92,17 @@ pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfi
         }
     }
     let client = build_client()?;
-    let lockfile =
-        resolve_lockfile(project, &client, upgrade, existing.as_ref(), HashMap::new()).await?;
-    warn_changed_url_tarballs(existing.as_ref(), &lockfile);
+    let lockfile = resolve_lockfile(
+        project,
+        &client,
+        upgrade,
+        existing.as_ref(),
+        HashMap::new(),
+        strategy,
+        exclude_newer,
+    )
+    .await?;
+    check_changed_url_tarballs(existing.as_ref(), &lockfile, upgrade)?;
     project
         .save_lockfile(&lockfile)
         .context("Failed to write uvr.lock")?;
@@ -81,26 +120,73 @@ pub async fn resolve_and_lock(project: &Project, upgrade: bool) -> Result<Lockfi
 pub async fn resolve_only_upgraded(
     project: &Project,
     pins: HashMap<String, PackageInfo>,
+    strategy: Option<ResolutionStrategy>,
 ) -> Result<Lockfile> {
     let client = build_client()?;
-    // --upgrade: don't reuse locked bioc_version, re-detect fresh
-    resolve_lockfile(project, &client, true, None, pins).await
+    // --upgrade: don't reuse locked bioc_version, re-detect fresh. A dated
+    // lock keeps its date: the held-back packages come from that snapshot,
+    // and the upgraded ones must too.
+    let date = project
+        .load_lockfile()
+        .ok()
+        .flatten()
+        .and_then(|lf| lf.r.resolved_as_of);
+    resolve_lockfile(
+        project,
+        &client,
+        true,
+        None,
+        pins,
+        strategy,
+        date.as_deref(),
+    )
+    .await
 }
 
 /// Core resolution logic shared by `resolve_and_lock` and `resolve_only`.
 /// `existing` is the current lockfile on disk, used to preserve the locked
 /// Bioconductor version across re-resolves (unless `upgrade` is true).
+/// `strategy` and `exclude_newer` override the manifest's `[resolution]`
+/// settings.
 async fn resolve_lockfile(
     project: &Project,
     client: &reqwest::Client,
     upgrade: bool,
     existing: Option<&Lockfile>,
     pins: HashMap<String, PackageInfo>,
+    strategy: Option<ResolutionStrategy>,
+    exclude_newer: Option<&str>,
 ) -> Result<Lockfile> {
+    let strategy = strategy.unwrap_or_else(|| project.manifest.resolution_strategy());
+    // A date from `--exclude-newer` lives only in the lock. It stays there
+    // until uvr.toml names a date or `--upgrade` asks for today's CRAN, so a
+    // later `uvr add` or `uvr lock -P` does not quietly move every package
+    // to its current release.
+    let as_of = exclude_newer
+        .or(project.manifest.exclude_newer())
+        .or(existing
+            .filter(|_| !upgrade)
+            .and_then(|lf| lf.r.resolved_as_of.as_deref()))
+        .map(snapshot_date)
+        .transpose()?;
+    if let Some(date) = &as_of {
+        if let Some(live) = live_sources_note(&project.manifest) {
+            tracing::warn!(
+                "exclude-newer {date} applies to CRAN only; {live} have no dated \
+                 snapshot and resolve from their current state"
+            );
+        }
+    }
     // Query the actual running R version to pin in the lockfile.
     let r_constraint = project.manifest.project.r_version.as_deref();
     let r_binary_opt = find_r_binary(r_constraint).ok();
     let actual_r_version = r_binary_opt.as_deref().and_then(query_r_version);
+    // The active R's base packages extend the resolver's hardcoded list, so a
+    // base package that a newer R adds is not looked up in a registry (#169).
+    let r_base_packages = r_binary_opt
+        .as_deref()
+        .and_then(query_r_base_packages)
+        .unwrap_or_default();
 
     let spinner = make_spinner("Resolving dependencies...");
 
@@ -174,7 +260,12 @@ async fn resolve_lockfile(
     };
 
     // Fetch all indices in parallel: CRAN + Bioc + custom repos + git deps.
-    let cran_fut = CranRegistry::fetch(client, upgrade);
+    let cran_fut = async {
+        match &as_of {
+            Some(date) => CranRegistry::fetch_snapshot(client, date, upgrade).await,
+            None => CranRegistry::fetch(client, upgrade).await,
+        }
+    };
     let bioc_fut = async {
         match &bioc_release {
             Some(rel) => BiocRegistry::fetch_release(client, rel)
@@ -218,7 +309,7 @@ async fn resolve_lockfile(
     let (cran_result, bioc_result, git_result, custom_result) =
         tokio::join!(cran_fut, bioc_fut, git_fut, custom_fut,);
 
-    let cran = cran_result.context("Failed to fetch CRAN index")?;
+    let mut cran = cran_result.context("Failed to fetch CRAN index")?;
     let bioc_opt = bioc_result?;
     let mut pre_resolved = git_result?;
     let custom_registries: Vec<CranRegistry> = custom_result?;
@@ -236,34 +327,82 @@ async fn resolve_lockfile(
     // The resolver records the Bioconductor release in the lockfile so it's
     // fully self-describing (#153).
     let resolved_bioc = bioc_opt.as_ref().map(|b| b.release());
-    let chain = if !custom_registries.is_empty() || bioc_opt.is_some() {
-        let mut chain: Vec<&dyn PackageRegistry> = Vec::new();
-        for reg in &custom_registries {
-            chain.push(reg);
+    // Lowest resolution needs older CRAN releases, which the index lacks.
+    // Each pass reports the packages it looked at without them; load those
+    // and resolve again until a pass needs nothing new (#193). Highest
+    // resolution finishes in one pass unless a bound excludes the current
+    // release, as an override to an older version does (#195).
+    let mut lockfile = loop {
+        let result = {
+            let chain = if !custom_registries.is_empty() || bioc_opt.is_some() {
+                let mut chain: Vec<&dyn PackageRegistry> = Vec::new();
+                for reg in &custom_registries {
+                    chain.push(reg);
+                }
+                if let Some(ref bioc) = bioc_opt {
+                    chain.push(bioc);
+                }
+                chain.push(&cran);
+                Some(RegistryChain::new(chain))
+            } else {
+                None
+            };
+            let registry: &dyn PackageRegistry = chain
+                .as_ref()
+                .map(|chain| chain as &dyn PackageRegistry)
+                .unwrap_or(&cran);
+            Resolver::new(registry)
+                .with_base_packages(r_base_packages.clone())
+                .with_strategy(strategy)
+                .resolve(
+                    &project.manifest,
+                    actual_r_version.as_deref(),
+                    resolved_bioc,
+                    pre_resolved.clone(),
+                )
+        };
+        let wanted = cran.take_wanted_history();
+        if wanted.is_empty() {
+            break result.context("Dependency resolution failed")?;
         }
-        if let Some(ref bioc) = bioc_opt {
-            chain.push(bioc);
+        if let Err(e) = cran.load_history(client, wanted).await {
+            // Under `highest` the history is only wanted because a bound
+            // excluded the current release; without it, the resolver's own
+            // error ("no version satisfies ...") is the one to show. The
+            // lowest modes need it to mean anything, so they fail.
+            if strategy != ResolutionStrategy::Highest {
+                return Err(e).context("Failed to load older CRAN releases");
+            }
+            tracing::warn!("Could not load older CRAN releases: {e}");
+            break result.context("Dependency resolution failed")?;
         }
-        chain.push(&cran);
-        Some(RegistryChain::new(chain))
-    } else {
-        None
     };
-    let registry: &dyn PackageRegistry = chain
-        .as_ref()
-        .map(|chain| chain as &dyn PackageRegistry)
-        .unwrap_or(&cran);
-    let lockfile = Resolver::new(registry)
-        .resolve(
-            &project.manifest,
-            actual_r_version.as_deref(),
-            resolved_bioc,
-            pre_resolved,
-        )
-        .context("Dependency resolution failed")?;
+    lockfile.r.resolved_as_of = as_of;
 
     spinner.finish_and_clear();
     Ok(lockfile)
+}
+
+/// Name the manifest's sources that `exclude-newer` cannot cap, because they
+/// have no dated snapshot (#194). `None` when every source is CRAN.
+fn live_sources_note(manifest: &uvr_core::manifest::Manifest) -> Option<String> {
+    let deps = || {
+        manifest
+            .dependencies
+            .values()
+            .chain(manifest.dev_dependencies.values())
+    };
+    let mut live = Vec::new();
+    if deps().any(|s| s.is_bioc()) {
+        live.push("Bioconductor packages".to_string());
+    }
+    for source in &manifest.sources {
+        live.push(format!("packages from repository '{}'", source.name));
+    }
+    if deps().any(|s| matches!(s, DependencySpec::Detailed(d) if d.git.is_some())) {
+        live.push("git dependencies".to_string());
+    }
+    (!live.is_empty()).then(|| live.join(", "))
 }
 
 /// Load the existing lockfile, warning (not erroring) on parse failures.
@@ -277,6 +416,122 @@ fn load_existing_lockfile(project: &Project) -> Option<Lockfile> {
             None
         }
     }
+}
+
+/// Pins for a targeted upgrade (`uvr update <pkg>`, `uvr lock
+/// --upgrade-package`): every locked package except `targets`, held at its
+/// locked version (#127). Each target must be a direct or dev dependency; a
+/// git target is simply left unpinned, so its ref re-resolves.
+pub fn targeted_upgrade_pins(
+    manifest: &uvr_core::manifest::Manifest,
+    old: Option<&Lockfile>,
+    targets: &[String],
+) -> Result<HashMap<String, PackageInfo>> {
+    for pkg in targets {
+        if !manifest.dependencies.contains_key(pkg) && !manifest.dev_dependencies.contains_key(pkg)
+        {
+            anyhow::bail!(
+                "Package '{}' is not in the manifest. Use `uvr add {0}` to add it.",
+                pkg
+            );
+        }
+    }
+    let mut pins = HashMap::new();
+    for pkg in old.map(|lf| lf.packages.as_slice()).unwrap_or_default() {
+        if !targets.contains(&pkg.name) {
+            pins.insert(
+                pkg.name.clone(),
+                uvr_core::resolver::locked_to_package_info(pkg)?,
+            );
+        }
+    }
+    Ok(pins)
+}
+
+/// `uvr lock --upgrade-package`: the lock-only half of `uvr update <pkg>`.
+pub async fn run_upgrade_package(
+    packages: Vec<String>,
+    strategy: Option<ResolutionStrategy>,
+) -> Result<()> {
+    let project = Project::find_cwd().context("Not inside a uvr project")?;
+    let start = ui::now();
+    ui::info(format!(
+        "Upgrading {} in uvr.lock",
+        packages
+            .iter()
+            .map(|p| ui::palette::pkg(p).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    let changed = upgrade_packages_in_lock(&project, &packages, |pins| {
+        resolve_only_upgraded(&project, pins, strategy)
+    })
+    .await?;
+    if changed {
+        ui::summary(
+            "Lockfile updated — nothing installed; run `uvr sync` to apply",
+            format!(
+                "resolved in {}",
+                ui::palette::format_duration(start.elapsed())
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Re-resolve `packages` with everything else pinned and write `uvr.lock`
+/// only if the result differs; returns whether it wrote. Never installs.
+/// `resolve` turns pins into a lockfile (the network resolve in production,
+/// a fixture index in tests).
+async fn upgrade_packages_in_lock<F, Fut>(
+    project: &Project,
+    packages: &[String],
+    resolve: F,
+) -> Result<bool>
+where
+    F: FnOnce(HashMap<String, PackageInfo>) -> Fut,
+    Fut: std::future::Future<Output = Result<Lockfile>>,
+{
+    let old = project.load_lockfile().context("Failed to read uvr.lock")?;
+    let pins = targeted_upgrade_pins(&project.manifest, old.as_ref(), packages)?;
+    // Without a lock there is nothing to hold back; a full resolve would
+    // quietly move every package.
+    let Some(old) = old else {
+        anyhow::bail!("No uvr.lock to upgrade in. Run `uvr lock` first.");
+    };
+    let new = resolve(pins).await.with_context(|| {
+        format!(
+            "Targeted upgrade failed with the other packages held at their locked versions; \
+             uvr.lock is unchanged. If the error above is a version conflict, the upgraded \
+             package needs a newer version of a held-back dependency — upgrade that package \
+             too (`uvr lock --upgrade-package {} --upgrade-package <conflicting-pkg>`) or \
+             upgrade everything with `uvr lock --upgrade`.",
+            packages.join(" --upgrade-package ")
+        )
+    })?;
+
+    if new == old {
+        ui::success("Nothing to upgrade — uvr.lock unchanged");
+        return Ok(false);
+    }
+    for pkg in &new.packages {
+        match old.get_package(&pkg.name) {
+            Some(prev) if prev.version != pkg.version => {
+                ui::row_upgrade(&pkg.name, &prev.version, &pkg.version)
+            }
+            None => ui::row_added(&pkg.name, &pkg.version),
+            _ => {}
+        }
+    }
+    for pkg in &old.packages {
+        if new.get_package(&pkg.name).is_none() {
+            ui::row_removed(&pkg.name, &pkg.version);
+        }
+    }
+    project
+        .save_lockfile(&new)
+        .context("Failed to write uvr.lock")?;
+    Ok(true)
 }
 
 /// Which registry to query for a `git = "..."` manifest value.
@@ -528,8 +783,11 @@ fn collect_git_requests(manifest: &uvr_core::manifest::Manifest) -> Result<VecDe
         .collect()
 }
 
+/// Queue the `Remotes:` entries declared by the package `parent`. Messages
+/// name `parent`, so a bad entry can be traced back to its DESCRIPTION.
 fn enqueue_remote_entries(
     queue: &mut VecDeque<GitRequest>,
+    parent: &str,
     entries: Vec<uvr_core::manifest::RemoteEntry>,
     parent_dependencies: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
@@ -544,7 +802,8 @@ fn enqueue_remote_entries(
                 bound: true,
             } => {
                 anyhow::bail!(
-                    "Unsupported bound Remotes entry '{entry}': {reason}; refusing registry fallback"
+                    "Unsupported bound Remotes entry '{entry}' in '{parent}': {reason}; \
+                     refusing registry fallback"
                 );
             }
             uvr_core::manifest::RemoteEntry::Unsupported {
@@ -552,7 +811,8 @@ fn enqueue_remote_entries(
                 reason,
                 bound: false,
             } => tracing::warn!(
-                "Ignoring unbound Remotes entry '{entry}': {reason}; falling back to registry resolution"
+                "Ignoring unbound Remotes entry '{entry}' in '{parent}': {reason}; \
+                 falling back to registry resolution"
             ),
         }
     }
@@ -659,12 +919,18 @@ fn check_url_package_name(key: &str, url: &str, actual: &str) -> Result<()> {
     Ok(())
 }
 
-/// Re-locking accepts a URL tarball whose bytes changed, which `uvr sync`
-/// refuses as a checksum mismatch. Say so, so the change is never silent.
-/// Only for resolutions that are written to disk.
-fn warn_changed_url_tarballs(existing: Option<&Lockfile>, fresh: &Lockfile) {
+/// A URL tarball whose bytes changed since uvr.lock was written is accepted
+/// only by `uvr lock --upgrade`, which says so. Any other re-lock (`uvr lock`
+/// on a stale lock, `uvr add` of another package) refuses: it would
+/// otherwise adopt the new bytes as a side effect, the change `uvr sync`
+/// refuses as a checksum mismatch. Only for resolutions written to disk.
+fn check_changed_url_tarballs(
+    existing: Option<&Lockfile>,
+    fresh: &Lockfile,
+    upgrade: bool,
+) -> Result<()> {
     let Some(existing) = existing else {
-        return;
+        return Ok(());
     };
     for pkg in fresh
         .packages
@@ -675,6 +941,15 @@ fn warn_changed_url_tarballs(existing: Option<&Lockfile>, fresh: &Lockfile) {
             continue;
         };
         if old.url == pkg.url && old.checksum != pkg.checksum {
+            if !upgrade {
+                anyhow::bail!(
+                    "The file at {} changed since uvr.lock was written ({} -> {}). \
+                     Run `uvr lock --upgrade` to accept the new file.",
+                    pkg.url.as_deref().unwrap_or_default(),
+                    old.checksum.as_deref().unwrap_or("no checksum"),
+                    pkg.checksum.as_deref().unwrap_or("no checksum"),
+                );
+            }
             tracing::warn!(
                 "The file at {} changed since uvr.lock was written ({} -> {}); uvr.lock now \
                  records the new checksum.",
@@ -684,6 +959,7 @@ fn warn_changed_url_tarballs(existing: Option<&Lockfile>, fresh: &Lockfile) {
             );
         }
     }
+    Ok(())
 }
 
 /// Resolve source-chained git dependencies. Bound requests are required and
@@ -700,7 +976,7 @@ async fn resolve_git_deps(
     // A manifest URL tarball is a manifest source like a git one, so its
     // `Remotes:` join the walk (#244 source-chain rule).
     for (info, remotes, parent_dependencies) in url_seeds {
-        enqueue_remote_entries(&mut queue, remotes, &parent_dependencies)?;
+        enqueue_remote_entries(&mut queue, &info.name, remotes, &parent_dependencies)?;
         resolved_from.insert(info.name.clone(), info.url.clone());
         pre_resolved.insert(info.name.clone(), info);
     }
@@ -840,8 +1116,9 @@ async fn resolve_git_deps(
             }
         };
 
-        outcomes.insert(identity, Ok(info.name.clone()));
-        ensure_bound_name(&request, &info.name)?;
+        let parent = info.name.clone();
+        outcomes.insert(identity, Ok(parent.clone()));
+        ensure_bound_name(&request, &parent)?;
 
         if let Some(existing) = pre_resolved.get(&info.name) {
             if !is_same_resolution(existing, &info) {
@@ -874,7 +1151,7 @@ async fn resolve_git_deps(
             pre_resolved.insert(info.name.clone(), info);
         }
 
-        enqueue_remote_entries(&mut queue, remotes, &parent_dependencies)?;
+        enqueue_remote_entries(&mut queue, &parent, remotes, &parent_dependencies)?;
     }
 
     Ok(pre_resolved)
@@ -1110,6 +1387,7 @@ mod tests {
         let mut queue = VecDeque::new();
         enqueue_remote_entries(
             &mut queue,
+            "parent",
             vec![
                 remote(
                     "alias",
@@ -1150,6 +1428,7 @@ mod tests {
         let mut queue = VecDeque::new();
         enqueue_remote_entries(
             &mut queue,
+            "parent",
             vec![remote(
                 "suggested",
                 false,
@@ -1179,6 +1458,7 @@ mod tests {
         let first_dependencies = ["child"].into_iter().map(str::to_string).collect();
         enqueue_remote_entries(
             &mut queue,
+            "parent",
             vec![remote(
                 "child",
                 false,
@@ -1195,6 +1475,7 @@ mod tests {
         let child_dependencies = ["grandchild"].into_iter().map(str::to_string).collect();
         enqueue_remote_entries(
             &mut queue,
+            "parent",
             vec![remote(
                 "grandchild",
                 false,
@@ -1216,6 +1497,7 @@ mod tests {
         let mut queue = VecDeque::new();
         let error = enqueue_remote_entries(
             &mut queue,
+            "parentpkg",
             vec![RemoteEntry::Unsupported {
                 entry: "owner/repo/subdir#42".into(),
                 reason: "pull requests are unsupported".into(),
@@ -1226,6 +1508,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("refusing registry fallback"), "{error}");
+        assert!(
+            error.contains("'owner/repo/subdir#42' in 'parentpkg'"),
+            "{error}"
+        );
 
         let exact = GitRequest {
             provider: GitKind::GitHub,
@@ -1256,18 +1542,33 @@ mod tests {
 
     #[test]
     fn unsupported_unbound_root_remote_is_not_enqueued() {
+        // Capture the warning: it must name the entry and the package that
+        // declared it (#168).
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::sync::Arc::new(log.reopen().unwrap()))
+            .with_ansi(false)
+            .finish();
         let mut queue = VecDeque::new();
-        enqueue_remote_entries(
-            &mut queue,
-            vec![RemoteEntry::Unsupported {
-                entry: "owner/repo#42".into(),
-                reason: "pull requests are unsupported".into(),
-                bound: false,
-            }],
-            &Default::default(),
-        )
-        .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            enqueue_remote_entries(
+                &mut queue,
+                "parentpkg",
+                vec![RemoteEntry::Unsupported {
+                    entry: "owner/repo#42".into(),
+                    reason: "pull requests are unsupported".into(),
+                    bound: false,
+                }],
+                &Default::default(),
+            )
+            .unwrap();
+        });
         assert!(queue.is_empty());
+        let logged = std::fs::read_to_string(log.path()).unwrap();
+        assert!(
+            logged.contains("WARN") && logged.contains("'owner/repo#42' in 'parentpkg'"),
+            "{logged}"
+        );
     }
 
     #[tokio::test]
@@ -1486,6 +1787,32 @@ mod tests {
     }
 
     #[test]
+    fn exclude_newer_names_every_source_without_a_snapshot() {
+        // #194: CRAN-only projects get no warning.
+        let mut manifest = uvr_core::manifest::Manifest::new("t", None);
+        manifest.add_dep("glue".into(), DependencySpec::Version("*".into()), false);
+        assert_eq!(live_sources_note(&manifest), None);
+
+        manifest.add_dep(
+            "DESeq2".into(),
+            DependencySpec::Detailed(uvr_core::manifest::DetailedDep {
+                bioc: Some(true),
+                ..Default::default()
+            }),
+            false,
+        );
+        manifest.add_dep("root".into(), git_dep("owner/root", None, None), true);
+        manifest.sources.push(uvr_core::manifest::PackageSource {
+            name: "internal".into(),
+            url: "https://repo.example".into(),
+        });
+        assert_eq!(
+            live_sources_note(&manifest).as_deref(),
+            Some("Bioconductor packages, packages from repository 'internal', git dependencies")
+        );
+    }
+
+    #[test]
     fn existing_provider_classification_is_unchanged() {
         assert_eq!(classify_git("tidyverse/ggplot2"), GitKind::GitHub);
         assert_eq!(
@@ -1502,5 +1829,123 @@ mod tests {
         );
         // A GitHub repository named like a prefix is still GitHub.
         assert_eq!(classify_git("git/git"), GitKind::GitHub);
+    }
+
+    // ── lock --upgrade-package (#196) ──
+
+    const OLD_INDEX: &str = "Package: jsonlite\nVersion: 1.8.0\n\n\
+        Package: shiny\nVersion: 1.0.0\nImports: rlang\n\n\
+        Package: rlang\nVersion: 1.0.0\n";
+    const NEW_INDEX: &str = "Package: jsonlite\nVersion: 1.9.0\n\n\
+        Package: shiny\nVersion: 1.1.0\nImports: rlang\n\n\
+        Package: rlang\nVersion: 1.1.0\n";
+
+    /// Stand-in for `resolve_only_upgraded`: the same resolver, fed a
+    /// fixture PACKAGES index instead of a live CRAN fetch.
+    fn resolve_fixture(
+        project: &Project,
+        index: &str,
+        pins: HashMap<String, PackageInfo>,
+    ) -> Result<Lockfile> {
+        let registry = CranRegistry::for_test(
+            uvr_core::registry::cran::parse_packages_gz(index)?,
+            "https://fixture.invalid/src/contrib".into(),
+        );
+        Ok(Resolver::new(&registry).resolve(&project.manifest, None, None, pins)?)
+    }
+
+    /// A project depending on jsonlite and shiny (rlang only transitively),
+    /// locked against `OLD_INDEX`, with jsonlite 1.8.0 in its library.
+    fn locked_project() -> (tempfile::TempDir, Project) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manifest = uvr_core::manifest::Manifest::new("t", None);
+        for name in ["jsonlite", "shiny"] {
+            manifest.add_dep(name.into(), DependencySpec::Version("*".into()), false);
+        }
+        manifest.write(&dir.path().join("uvr.toml")).unwrap();
+        let project = Project::find(dir.path()).unwrap();
+        let lock = resolve_fixture(&project, OLD_INDEX, HashMap::new()).unwrap();
+        project.save_lockfile(&lock).unwrap();
+        let installed = project.dot_uvr_dir().join("library").join("jsonlite");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(installed.join("DESCRIPTION"), "Version: 1.8.0\n").unwrap();
+        (dir, project)
+    }
+
+    async fn upgrade(project: &Project, target: &str, index: &str) -> Result<bool> {
+        upgrade_packages_in_lock(project, &[target.to_string()], |pins| {
+            std::future::ready(resolve_fixture(project, index, pins))
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn upgrade_package_moves_only_the_named_package_and_installs_nothing() {
+        let (_dir, project) = locked_project();
+        assert!(upgrade(&project, "jsonlite", NEW_INDEX).await.unwrap());
+
+        let lock = project.load_lockfile().unwrap().unwrap();
+        let version = |name| lock.get_package(name).unwrap().version.clone();
+        assert_eq!(version("jsonlite"), "1.9.0");
+        assert_eq!(version("shiny"), "1.0.0", "direct dep must be held");
+        assert_eq!(version("rlang"), "1.0.0", "transitive dep must be held");
+
+        let library = project.dot_uvr_dir().join("library");
+        let entries: Vec<_> = std::fs::read_dir(&library)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["jsonlite"]);
+        assert_eq!(
+            std::fs::read_to_string(library.join("jsonlite").join("DESCRIPTION")).unwrap(),
+            "Version: 1.8.0\n",
+            "the library must not be touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_package_conflict_errors_and_leaves_the_lock_unchanged() {
+        let (_dir, project) = locked_project();
+        let before = std::fs::read(project.lock_path()).unwrap();
+        // The new shiny needs a newer rlang than the held-back one.
+        let index = NEW_INDEX.replace("Imports: rlang", "Imports: rlang (>= 1.1.0)");
+        let err = upgrade(&project, "shiny", &index).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Version conflict for package 'rlang'"),
+            "{msg}"
+        );
+        assert!(msg.contains("uvr.lock is unchanged"), "{msg}");
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn repeated_upgrade_package_is_a_byte_identical_no_op() {
+        let (_dir, project) = locked_project();
+        assert!(upgrade(&project, "jsonlite", NEW_INDEX).await.unwrap());
+        let before = std::fs::read(project.lock_path()).unwrap();
+        assert!(!upgrade(&project, "jsonlite", NEW_INDEX).await.unwrap());
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn upgrade_package_rejects_non_manifest_names_and_a_missing_lock() {
+        let (_dir, project) = locked_project();
+        let before = std::fs::read(project.lock_path()).unwrap();
+        // Unknown, and transitive-only: `uvr update <pkg>` rejects both too.
+        for name in ["nosuchpkg", "rlang"] {
+            let err = upgrade(&project, name, NEW_INDEX).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("'{name}' is not in the manifest")),
+                "{err}"
+            );
+        }
+        assert_eq!(std::fs::read(project.lock_path()).unwrap(), before);
+
+        std::fs::remove_file(project.lock_path()).unwrap();
+        let err = upgrade(&project, "jsonlite", NEW_INDEX).await.unwrap_err();
+        assert!(err.to_string().contains("No uvr.lock"), "{err}");
+        assert!(!project.lock_path().exists());
     }
 }

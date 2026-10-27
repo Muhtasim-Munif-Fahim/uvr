@@ -152,26 +152,93 @@ fn has_scannable_extension(path: &Path) -> bool {
     )
 }
 
-/// Strip R `#` comments from source, preserving newlines so line structure
-/// and the surrounding comma-separated structure survive for the box spec
-/// regex. Used by the `box::use` pass, over the whole file. It does not
-/// model `#` inside string literals: `box::use()` arguments never hold
-/// strings, so a `#` in a string elsewhere only truncates its own line (a
-/// `box::use` later on that same line is missed).
-fn strip_r_comments(input: &str) -> String {
+/// Strip R `#` comments and blank string literals, preserving newlines so
+/// line structure and the surrounding comma-separated structure survive for
+/// the box spec regex. Used by the `box::use` pass, over the whole file, so
+/// `"box::use(x)"` in a string is not read as an import and a `#` inside a
+/// string does not hide the code after it. String contents become spaces;
+/// the quotes stay. Raw strings (`r"(...)"`, `R"-[...]-"`) are handled; `\`
+/// escapes in ordinary strings are honoured, and those end at the line.
+fn strip_comments_and_strings(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
         if ch == '#' {
-            for c in chars.by_ref() {
-                if c == '\n' {
-                    out.push('\n');
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Raw string: r"(...)", R'---[...]---' etc. The `r` must start a
+        // token, so `bar"` (an identifier then a string) is not one.
+        let starts_token =
+            i == 0 || !(chars[i - 1].is_alphanumeric() || matches!(chars[i - 1], '.' | '_'));
+        if matches!(ch, 'r' | 'R') && starts_token && matches!(chars.get(i + 1), Some('"' | '\'')) {
+            let quote = chars[i + 1];
+            let mut j = i + 2;
+            while chars.get(j) == Some(&'-') {
+                j += 1;
+            }
+            let dashes = j - (i + 2);
+            let close = match chars.get(j) {
+                Some('(') => Some(')'),
+                Some('[') => Some(']'),
+                Some('{') => Some('}'),
+                _ => None,
+            };
+            if let Some(close) = close {
+                out.extend(&chars[i..=j]);
+                let mut k = j + 1;
+                let end = loop {
+                    if k >= chars.len() {
+                        break None;
+                    }
+                    if chars[k] == close
+                        && (1..=dashes).all(|d| chars.get(k + d) == Some(&'-'))
+                        && chars.get(k + dashes + 1) == Some(&quote)
+                    {
+                        break Some(k);
+                    }
+                    k += 1;
+                };
+                let stop = end.unwrap_or(chars.len());
+                out.extend(chars[j + 1..stop].iter().map(|&c| blank(c)));
+                if let Some(k) = end {
+                    out.extend(&chars[k..=k + dashes + 1]);
+                    i = k + dashes + 2;
+                } else {
+                    i = stop;
+                }
+                continue;
+            }
+        }
+        if ch == '"' || ch == '\'' {
+            out.push(ch);
+            i += 1;
+            while i < chars.len() {
+                let c = chars[i];
+                if c == '\\' && chars.get(i + 1).is_some_and(|&n| n != '\n') {
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                // Ended at the line break too: an apostrophe in R Markdown
+                // prose ("don't") must not blank the chunks after it. A
+                // string spanning lines is rare in R code.
+                if c == ch || c == '\n' {
+                    out.push(c);
                     break;
                 }
+                out.push(' ');
             }
-        } else {
-            out.push(ch);
+            continue;
         }
+        out.push(ch);
+        i += 1;
     }
     out
 }
@@ -264,7 +331,7 @@ impl PackageDetector {
         // argument list. The other detectors keep running on raw content
         // (roxygen needs `#'`, and `library`/`::` in comments is an
         // accepted trade-off).
-        let decommented = strip_r_comments(content);
+        let decommented = strip_comments_and_strings(content);
         for cap in self.box_use.captures_iter(&decommented) {
             if let Some(args) = cap.get(1) {
                 for spec in self.box_use_spec.captures_iter(args.as_str()) {
@@ -401,6 +468,38 @@ box::use(
         assert!(!found.contains("tbl"), "got {found:?}");
         assert!(!found.contains("st_filter"), "got {found:?}");
         assert!(!found.contains("filter"), "got {found:?}");
+    }
+
+    #[test]
+    fn extract_box_use_ignores_imports_inside_strings() {
+        let detector = PackageDetector::new();
+        let src = concat!(
+            "msg <- \"try box::use(fakepkg)\"\n",
+            "other <- 'box::use(alsofake)'\n",
+            "raw <- r\"-(box::use(rawfake) \")\" )-\"\n",
+            "esc <- \"a \\\" box::use(escfake)\"\n",
+            "box::use(realpkg)\n",
+        );
+        let found = detector.extract(src);
+        assert!(found.contains("realpkg"), "got {found:?}");
+        for fake in ["fakepkg", "alsofake", "rawfake", "escfake"] {
+            assert!(!found.contains(fake), "{fake} leaked: {found:?}");
+        }
+    }
+
+    #[test]
+    fn extract_box_use_after_a_hash_in_a_string() {
+        let detector = PackageDetector::new();
+        let found = detector.extract("x <- \"#1\"; box::use(afterhash)\n");
+        assert!(found.contains("afterhash"), "got {found:?}");
+    }
+
+    #[test]
+    fn extract_box_use_in_rmd_after_prose_apostrophes() {
+        let detector = PackageDetector::new();
+        let src = "We don't load it globally.\n\n```{r}\nbox::use(chunkpkg)\n```\nIt's done.\n";
+        let found = detector.extract(src);
+        assert!(found.contains("chunkpkg"), "got {found:?}");
     }
 
     #[test]

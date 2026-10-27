@@ -263,6 +263,117 @@ fn test_r_install_rejects_an_empty_install_dir() {
 }
 
 #[test]
+fn test_resolution_flag_is_offered_on_lock_add_update() {
+    // #193: the strategy knob lives on every command that resolves.
+    for command in ["lock", "add", "update"] {
+        uvr_cmd()
+            .args([command, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--resolution"))
+            .stdout(predicate::str::contains("lowest-direct"));
+    }
+}
+
+#[test]
+fn test_resolution_flag_rejects_an_unknown_strategy() {
+    // clap refuses the value before any resolution (or network) starts.
+    let dir = init_project("badflag");
+    uvr_cmd()
+        .args(["lock", "--resolution", "newest"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("'newest'"))
+        .stderr(predicate::str::contains("lowest-direct"));
+}
+
+#[test]
+fn test_manifest_with_an_unknown_strategy_is_rejected() {
+    let dir = init_project("badtable");
+    let toml_path = dir.path().join("uvr.toml");
+    let mut toml = fs::read_to_string(&toml_path).unwrap();
+    toml.push_str("\n[resolution]\nstrategy = \"newest\"\n");
+    fs::write(&toml_path, toml).unwrap();
+    uvr_cmd()
+        .args(["lock"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("newest"));
+}
+
+#[test]
+fn test_exclude_newer_flag_is_offered_on_lock() {
+    uvr_cmd()
+        .args(["lock", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exclude-newer <DATE>"));
+}
+
+#[test]
+fn test_exclude_newer_flag_rejects_dates_without_a_snapshot() {
+    // #194: clap refuses the date before any network access.
+    let dir = init_project("baddate");
+    for (date, why) in [
+        ("2024-02-30", "expected YYYY-MM-DD"),
+        ("2017-01-01", "before 2017-10-10"),
+        ("2999-01-01", "in the future"),
+    ] {
+        uvr_cmd()
+            .args(["lock", "--exclude-newer", date])
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(why));
+    }
+}
+
+#[test]
+fn test_frozen_sync_resolves_at_the_manifest_exclude_newer_date() {
+    // #194: `sync --frozen` checks the lock against `[resolution]
+    // exclude-newer`. A date with no snapshot fails that check before any
+    // network access, which shows the date is read; `uvr lock` checks it too.
+    let dir = init_project("frozendate");
+    let toml_path = dir.path().join("uvr.toml");
+    let mut toml = fs::read_to_string(&toml_path).unwrap();
+    toml.push_str("\n[resolution]\nexclude-newer = \"2017-01-01\"\n");
+    fs::write(&toml_path, toml).unwrap();
+    fs::write(
+        dir.path().join("uvr.lock"),
+        "[r]\nversion = \"4.5.1\"\nresolved_as_of = \"2017-01-01\"\n",
+    )
+    .unwrap();
+    for args in [&["sync", "--frozen"][..], &["lock"][..]] {
+        uvr_cmd()
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("exclude-newer date 2017-01-01"));
+    }
+}
+
+#[test]
+fn test_manifest_with_a_range_override_is_rejected() {
+    // #195: an override is an exact version; ranges belong in constraints.
+    let dir = init_project("rangeoverride");
+    let toml_path = dir.path().join("uvr.toml");
+    let mut toml = fs::read_to_string(&toml_path).unwrap();
+    toml.push_str("\n[override-dependencies]\nrlang = \">=1.0\"\n");
+    fs::write(&toml_path, toml).unwrap();
+    uvr_cmd()
+        .args(["lock"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "[override-dependencies] rlang = \">=1.0\": an override is an exact version",
+        ));
+}
+
+#[test]
 fn test_sync_without_lockfile_fails() {
     let dir = init_project("no-lock-test");
     uvr_cmd()
@@ -271,6 +382,24 @@ fn test_sync_without_lockfile_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("uvr lock").or(predicate::str::contains("lockfile")));
+}
+
+#[test]
+fn test_sync_accepts_prune_all() {
+    // #255: the flag parses and reaches the command, which then fails on
+    // the missing lockfile like a plain `uvr sync`.
+    uvr_cmd()
+        .args(["sync", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--prune-all"));
+    let dir = init_project("prune-all-test");
+    uvr_cmd()
+        .args(["sync", "--prune-all"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No lockfile found"));
 }
 
 #[test]
@@ -316,6 +445,24 @@ fn test_add_no_lock_writes_github_subdirectory_dependency() {
     );
     assert!(content.contains(r#"rev = "v1.0""#), "{content}");
     assert!(!dir.path().join("uvr.lock").exists());
+}
+
+#[test]
+fn test_add_no_lock_accepts_remotes_style_subdirectory_spec() {
+    // #312: `owner/repo:subdir@ref` from the issue report.
+    let dir = init_project("subdir-colon-add");
+    uvr_cmd()
+        .args(["add", "--no-lock", "REditorSupport/vscode-R:sess@main"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(dir.path().join("uvr.toml")).unwrap();
+    let m: uvr_core::manifest::Manifest = content.parse().unwrap();
+    let dep = m.dependencies.get("sess").expect("sess dependency");
+    assert_eq!(dep.git(), Some("REditorSupport/vscode-R"));
+    assert_eq!(dep.subdirectory(), Some("sess"));
+    assert!(content.contains(r#"rev = "main""#), "{content}");
 }
 
 #[test]
@@ -667,6 +814,32 @@ fn test_update_dry_run_on_empty_project() {
         .stderr(predicate::str::contains("Dry run"));
 }
 
+// ─── lock ──────────────────────────────────────────────────
+
+#[test]
+fn test_lock_upgrade_package_rejects_unknown_name() {
+    // The name check runs before any index fetch, so this stays offline.
+    let dir = init_project("lock-upgrade-test");
+    uvr_cmd()
+        .args(["lock", "--upgrade-package", "nosuchpkg"])
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "'nosuchpkg' is not in the manifest",
+        ));
+    assert!(!dir.path().join("uvr.lock").exists());
+}
+
+#[test]
+fn test_lock_upgrade_package_conflicts_with_upgrade() {
+    uvr_cmd()
+        .args(["lock", "--upgrade", "-P", "jsonlite"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
 // ─── cache ─────────────────────────────────────────────────
 
 #[test]
@@ -707,6 +880,38 @@ fn test_cache_clean() {
         !entry.exists(),
         "seeded package cache entry should be removed"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cache_clean_reports_entries_it_cannot_remove() {
+    // #168: a clean where every removal fails used to print "Cache is already
+    // empty" and exit 0.
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempDir::new().unwrap();
+    let cache = home.path().join("cache");
+    let locked = cache.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("file"), b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores directory permissions, so there is nothing to test.
+    if std::fs::write(locked.join("probe"), b"").is_ok() {
+        return;
+    }
+
+    let assert = uvr_cmd()
+        .env("HOME", home.path())
+        .env("UVR_CACHE_DIR", &cache)
+        .env("UVR_PACKAGES_DIR", home.path().join("packages"))
+        .args(["cache", "clean"])
+        .assert();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert
+        .failure()
+        .stderr(predicate::str::contains("Failed to remove"))
+        .stderr(predicate::str::contains("Could not remove 1 cache entry"))
+        .stdout(predicate::str::contains("already empty").not());
 }
 
 #[test]
@@ -1754,7 +1959,7 @@ fn test_sync_url_dependency_verifies_checksum_then_installs() {
         .stderr(predicate::str::contains(&url))
         .stderr(predicate::str::contains(&stale))
         .stderr(predicate::str::contains(sha256(&bytes)))
-        .stderr(predicate::str::contains("run `uvr lock`"));
+        .stderr(predicate::str::contains("run `uvr lock --upgrade`"));
     let installed = dir.path().join(".uvr/library/urlpkg/DESCRIPTION");
     assert!(!installed.exists());
 
@@ -1830,6 +2035,60 @@ fn test_activate_emit_sh_is_valid_shell() {
     // ~/.Renviron can re-point R_LIBS_USER out from under the project.
     assert!(script.contains("R_ENVIRON="));
     assert!(script.contains("R_ENVIRON_USER="));
+}
+
+#[test]
+fn test_activate_leaves_another_tools_deactivate_alone() {
+    // #303: a Python venv defines `deactivate`. uvr used to define its own
+    // over it, and `unset -f deactivate` on the way out then left the shell
+    // with no deactivate at all, and the venv still active.
+    if !have_r() {
+        eprintln!("skipping: no R on PATH");
+        return;
+    }
+    let dir = init_project("venvclash");
+    let out = uvr_cmd()
+        .args(["activate", "--emit", "sh"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let script = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    fs::write(dir.path().join("emitted.sh"), &script).unwrap();
+    fs::write(
+        dir.path().join("drive.sh"),
+        r#"VIRTUAL_ENV=/fake/venv; export VIRTUAL_ENV
+deactivate() { echo "VENV-RAN"; unset VIRTUAL_ENV; unset -f deactivate; }
+. ./emitted.sh
+echo "ACTIVE=${R_LIBS_USER:-unset}"
+uvr_deactivate
+echo "AFTER_UVR libs=${R_LIBS_USER:-unset} venv=${VIRTUAL_ENV:-unset}"
+deactivate
+echo "AFTER_VENV venv=${VIRTUAL_ENV:-unset}"
+"#,
+    )
+    .unwrap();
+
+    let res = std::process::Command::new("sh")
+        .arg("./drive.sh")
+        .current_dir(dir.path())
+        .output()
+        .expect("run sh");
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(
+        stdout.contains("ACTIVE=") && !stdout.contains("ACTIVE=unset"),
+        "the project library was not applied:\n{stdout}"
+    );
+    // uvr's own name always works, and it restores only uvr's variables.
+    assert!(
+        stdout.contains("AFTER_UVR libs=unset venv=/fake/venv"),
+        "uvr_deactivate did not restore the shell, or touched the venv:\n{stdout}"
+    );
+    // The venv's function survived, so the user can still leave the venv.
+    assert!(
+        stdout.contains("VENV-RAN") && stdout.contains("AFTER_VENV venv=unset"),
+        "the venv's own deactivate was replaced:\n{stdout}{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
 }
 
 #[test]
@@ -2052,12 +2311,11 @@ fn test_stray_code_inside_the_header_names_the_offending_line() {
 }
 
 #[test]
-fn test_a_spec_grammar_this_slice_cannot_honour_is_rejected() {
-    // Passing `ggplot2>=3.4` through would reach the resolver as a literal
-    // package name and fail with "Package not found: ggplot2>=3.4" plus a
-    // nonsense `uvr add cran/ggplot2>=3.4@master` suggestion — naming
-    // neither the cause nor the fix.
-    let dir = script_dir("# /// script\n# dependencies = [\"ggplot2>=3.4\"]\n# ///\n");
+fn test_a_bad_spec_in_a_script_header_is_named_before_any_install() {
+    // #182: header entries use `uvr add`'s grammar, and a spec it refuses is
+    // a header error naming the entry — not a semver error from deep in the
+    // resolver after the index downloads.
+    let dir = script_dir("# /// script\n# dependencies = [\"ggplot2>>3.4\"]\n# ///\n");
     uvr_cmd()
         .args(["run", "script.R"])
         .current_dir(dir.path())
@@ -2066,7 +2324,8 @@ fn test_a_spec_grammar_this_slice_cannot_honour_is_rejected() {
         .stderr(predicate::str::contains(
             "Invalid script header in script.R",
         ))
-        .stderr(predicate::str::contains("not a plain package name"));
+        .stderr(predicate::str::contains("Invalid version constraint"))
+        .stderr(predicate::str::contains("ggplot2>>3.4"));
 }
 
 #[test]
@@ -2107,20 +2366,19 @@ fn test_a_second_header_block_is_a_hard_error() {
 fn test_header_text_cannot_smuggle_ansi_into_uvr_output() {
     // A header is text you accept from a stranger. `\u001b` is legal TOML
     // that decodes to a live ESC; printed raw it can repaint or overwrite
-    // uvr's own diagnostics. The r-pin warning is the interpolation site a
-    // successfully-parsed header reaches, so it is the one exercised here
-    // against the real binary.
+    // uvr's own diagnostics. An `r` value carrying one is not a valid
+    // constraint (#183), so the header error that quotes it is the
+    // interpolation site exercised here against the real binary.
     let dir = script_dir(
         "# /// script\n# r = \"\\u001b[31mINJECTED>=4.3\"\n# dependencies = []\n# ///\n",
     );
-    // The warning fires before an interpreter is resolved, so stderr carries
-    // it whether or not this machine has an R to continue with — the exit
-    // status is deliberately not asserted.
+    // Refused before an interpreter is looked for, so no R is needed here.
     let output = uvr_cmd()
         .args(["run", "script.R"])
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("\\u{1b}[31mINJECTED"),
@@ -2196,6 +2454,70 @@ fn test_headered_script_runs_standalone_in_an_empty_directory() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"ok\""));
+}
+
+#[test]
+#[ignore = "requires network access to CRAN/P3M and a managed R"]
+fn test_headered_script_honours_a_version_constraint() {
+    // #182: the header pins a version. A satisfiable pin installs and runs;
+    // an unsatisfiable one must fail, which proves the constraint reaches
+    // the resolver rather than being dropped.
+    let cache = TempDir::new().unwrap();
+    let dir = script_dir(
+        "# /// script\n\
+         # dependencies = [\"jsonlite>=1.8\"]\n\
+         # ///\n\
+         cat(as.character(packageVersion(\"jsonlite\") >= \"1.8\"))\n",
+    );
+    uvr_cmd()
+        .args(["run", "script.R"])
+        .current_dir(dir.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("TRUE"));
+
+    let impossible =
+        script_dir("# /// script\n# dependencies = [\"jsonlite>=999\"]\n# ///\nprint(1)\n");
+    uvr_cmd()
+        .args(["run", "script.R"])
+        .current_dir(impossible.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("jsonlite"));
+}
+
+#[test]
+#[ignore = "requires network access to GitHub, CRAN/P3M and a managed R"]
+fn test_headered_script_installs_a_github_package() {
+    // #182: a header entry can name a git source, as `uvr add` can.
+    let cache = TempDir::new().unwrap();
+    // praise is on CRAN too, so a successful run alone would pass even if
+    // the header's source were ignored; the environment's lockfile says
+    // where the package came from.
+    let dir = script_dir(
+        "# /// script\n\
+         # dependencies = [\"rladies/praise\"]\n\
+         # ///\n\
+         cat(praise::praise(\"PRAISED ${adjective}\"))\n",
+    );
+    uvr_cmd()
+        .args(["run", "script.R"])
+        .current_dir(dir.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PRAISED"));
+
+    let envs: Vec<_> = fs::read_dir(cache.path().join("with-envs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(envs.len(), 1, "{envs:?}");
+    let lock = fs::read_to_string(envs[0].join("uvr.lock")).unwrap();
+    assert!(lock.contains("name = \"praise\""), "{lock}");
+    assert!(lock.contains("source = \"github\""), "{lock}");
 }
 
 #[test]
@@ -2367,23 +2689,126 @@ fn test_headered_script_ignores_a_surrounding_r_version_pin() {
         .failure();
 }
 
-#[test]
-fn test_an_unsupported_r_pin_in_a_header_is_reported_not_swallowed() {
-    // `r` is parsed but not honoured until #183. Running against whichever R
-    // happens to be around without saying so is the trap this guards.
-    if !have_r() {
-        eprintln!("skipping: no R on PATH");
-        return;
+/// A temporary `UVR_R_INSTALL_DIR` holding a stand-in managed R for each of
+/// `versions`.
+///
+/// Each stand-in prints `FAKE-R <version>` and then its version, whatever it
+/// is asked: uvr's version probe reads the last version-shaped line, and a
+/// script run shows which R was chosen. The 3.0.x series keeps them clear of
+/// any real R on the machine, and a script with no dependencies never makes
+/// uvr ask them to install anything.
+#[cfg(unix)]
+fn fake_r_installs(versions: &[&str]) -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    for version in versions {
+        let bin = dir.path().join(version).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let r = bin.join("R");
+        fs::write(
+            &r,
+            format!("#!/bin/sh\necho FAKE-R {version}\necho {version}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&r, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let dir =
-        script_dir("# /// script\n# r = \">=4.3\"\n# dependencies = []\n# ///\ncat(\"RAN\\n\")\n");
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn test_a_header_r_constraint_selects_a_matching_installed_r() {
+    // #183: the newest installed R that satisfies `r` wins — not whichever R
+    // uvr would otherwise have picked (here, the real one on PATH).
+    let installs = fake_r_installs(&["3.0.1", "3.0.2", "3.1.0"]);
+    let cache = TempDir::new().unwrap();
+    let dir = script_dir("# /// script\n# r = \"~3.0\"\n# dependencies = []\n# ///\n");
     uvr_cmd()
         .args(["run", "script.R"])
         .current_dir(dir.path())
+        .env("UVR_R_INSTALL_DIR", installs.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .env("UVR_R_DOWNLOADS", "never")
         .assert()
         .success()
-        .stdout(predicate::str::contains("RAN"))
-        .stderr(predicate::str::contains("does not honour yet"));
+        .stdout(predicate::str::contains("FAKE-R 3.0.2"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_r_version_flag_overrides_the_header_r_constraint() {
+    // No installed R satisfies the header, so if the header won, this would
+    // fail on the `never` below instead of running.
+    let installs = fake_r_installs(&["3.0.1", "3.0.2"]);
+    let cache = TempDir::new().unwrap();
+    let dir = script_dir("# /// script\n# r = \">=99\"\n# dependencies = []\n# ///\n");
+    uvr_cmd()
+        .args(["run", "--r-version", "==3.0.1", "script.R"])
+        .current_dir(dir.path())
+        .env("UVR_R_INSTALL_DIR", installs.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .env("UVR_R_DOWNLOADS", "never")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("FAKE-R 3.0.1"));
+
+    // An explicit version that is not installed fails as it always has: only
+    // the header's own constraint may provision an R.
+    let out = uvr_cmd()
+        .args(["run", "--r-version", "==3.0.9", "script.R"])
+        .current_dir(dir.path())
+        .env("UVR_R_INSTALL_DIR", installs.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .env("UVR_R_DOWNLOADS", "never")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("R not found"), "{stderr}");
+    assert!(!stderr.contains("No R satisfies"), "{stderr}");
+}
+
+#[test]
+fn test_no_matching_r_with_downloads_disabled_names_the_constraint() {
+    // #183: `UVR_R_DOWNLOADS=never` refuses to fetch an R, and the error says
+    // what the script needs and how to get it.
+    let installs = TempDir::new().unwrap();
+    let dir = script_dir("# /// script\n# r = \"==3.0.1\"\n# dependencies = []\n# ///\n");
+    uvr_cmd()
+        .args(["run", "script.R"])
+        .current_dir(dir.path())
+        .env("UVR_R_INSTALL_DIR", installs.path())
+        .env("UVR_R_DOWNLOADS", "never")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "No R satisfies \"==3.0.1\" for script.R",
+        ))
+        .stderr(predicate::str::contains("UVR_R_DOWNLOADS=auto"));
+}
+
+#[test]
+#[ignore = "downloads a portable R build (~100 MB)"]
+fn test_a_header_r_constraint_installs_a_missing_r() {
+    // #183: nothing installed satisfies `r`, so uvr installs the newest
+    // matching build and runs the script with it. Run with
+    // `cargo test -- --ignored`.
+    let installs = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let dir = script_dir(
+        "# /// script\n# r = \"~4.4\"\n# dependencies = []\n# ///\n\
+         cat(\"RUNNING\", R.version$major, R.version$minor, \"\\n\")\n",
+    );
+    uvr_cmd()
+        .args(["run", "script.R"])
+        .current_dir(dir.path())
+        .env("UVR_R_INSTALL_DIR", installs.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("RUNNING 4 4."))
+        // The download's progress stays off the script's stdout.
+        .stdout(predicate::str::contains("Installing").not())
+        .stderr(predicate::str::contains("Installing R 4.4."));
 }
 
 // ─── IDE-mode scaffolding ─────────────────────────────────────────
@@ -2478,6 +2903,45 @@ fn test_init_unattended_writes_only_manifest_and_library() {
     assert!(!dir.path().join(".gitignore").exists());
     assert!(!dir.path().join(".uvr").join("activate").exists());
     assert!(!dir.path().join(".vscode").exists());
+}
+
+#[test]
+fn test_unattended_leaves_git_status_clean_except_for_the_manifest() {
+    let dir = TempDir::new().unwrap();
+    let git_status = || {
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(init.success());
+
+    uvr_cmd()
+        .args(["init", "--here", "cleanproj", "--unattended"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    // The library sits in `.uvr/`, which ignores itself: no root
+    // `.gitignore` edit is needed to keep it out of `git status`.
+    assert_eq!(git_status(), "?? uvr.toml\n");
+
+    // `uvr activate` normally backfills the shims (and a `.gitignore`
+    // entry). Unattended, it points at `--emit` instead.
+    uvr_cmd()
+        .args(["activate", "--unattended"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--emit sh"));
+    assert!(!dir.path().join(".uvr").join("activate").exists());
+    assert_eq!(git_status(), "?? uvr.toml\n");
 }
 
 #[test]
@@ -2589,4 +3053,256 @@ fn test_sysdeps_outside_a_project_fails() {
         .current_dir(dir.path())
         .assert()
         .failure();
+
+// ─── uvr add/remove --script (#184) ─────────────────────────
+
+/// `uvr <args…>` in `dir`, which must succeed.
+fn uvr_ok(dir: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
+    uvr_cmd()
+        .args(args)
+        .current_dir(dir.path())
+        .assert()
+        .success()
+}
+
+#[test]
+fn test_add_script_writes_a_header_and_remove_takes_it_away() {
+    // Inside a project on purpose: editing a script must leave it alone.
+    // (The default `--jobs` value must not trip the `--script` conflict.)
+    let dir = init_project("proj");
+    let manifest = fs::read(dir.path().join("uvr.toml")).unwrap();
+    let source = "#!/usr/bin/env -S uvr run\r\nprint(1)\r\n";
+    let script = dir.path().join("s.R");
+    fs::write(&script, source).unwrap();
+
+    uvr_ok(
+        &dir,
+        &["add", "jsonlite", "ggplot2@>=3.4", "--script", "s.R"],
+    )
+    .stdout(predicate::str::contains("Nothing installed"));
+    assert_eq!(
+        fs::read_to_string(&script).unwrap(),
+        "#!/usr/bin/env -S uvr run\r\n\
+         # /// script\r\n\
+         # dependencies = [\r\n\
+         #   \"ggplot2>=3.4\",\r\n\
+         #   \"jsonlite\",\r\n\
+         # ]\r\n\
+         # ///\r\n\
+         \r\n\
+         print(1)\r\n"
+    );
+
+    uvr_ok(&dir, &["remove", "jsonlite", "ggplot2", "--script", "s.R"])
+        .stdout(predicate::str::contains("header was removed"));
+    assert_eq!(fs::read_to_string(&script).unwrap(), source);
+
+    assert_eq!(fs::read(dir.path().join("uvr.toml")).unwrap(), manifest);
+    assert!(!dir.path().join("uvr.lock").exists());
+}
+
+#[test]
+fn test_add_script_replaces_a_spec_in_place_and_says_so() {
+    let dir = script_dir(
+        "# /// script\n\
+         # r = \"4.4\"\n\
+         # dependencies = [\n\
+         #   \"cli\",\n\
+         #   \"ggplot2\",  # plots\n\
+         # ]\n\
+         # ///\n\
+         print(1)\n",
+    );
+    uvr_ok(&dir, &["add", "ggplot2>=3.5", "--script", "script.R"])
+        .stdout(predicate::str::contains("(updated)"));
+    // `--bioc` marks the packages it is given, as in a project.
+    uvr_ok(&dir, &["add", "DESeq2", "--bioc", "--script", "script.R"]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        "# /// script\n\
+         # r = \"4.4\"\n\
+         # dependencies = [\n\
+         #   \"cli\",\n\
+         #   \"DESeq2 (bioc)\",\n\
+         #   \"ggplot2>=3.5\",  # plots\n\
+         # ]\n\
+         # ///\n\
+         print(1)\n"
+    );
+}
+
+#[test]
+fn test_add_script_keeps_an_existing_constraint_for_a_plain_name() {
+    let source = "# /// script\n\
+                  # dependencies = [\n\
+                  #   \"ggplot2>=3.5\",  # plots\n\
+                  # ]\n\
+                  # ///\n\
+                  print(1)\n";
+    let dir = script_dir(source);
+    uvr_ok(&dir, &["add", "ggplot2", "--script", "script.R"])
+        .stdout(predicate::str::contains("unchanged"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn test_add_script_writes_a_url_tarball() {
+    let dir = script_dir("print(1)\n");
+    let url = "https://example.org/src/contrib/pkg_1.2.0.tar.gz";
+    uvr_ok(&dir, &["add", url, "--script", "script.R"]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        format!("# /// script\n# dependencies = [\n#   \"{url}\",\n# ]\n# ///\n\nprint(1)\n")
+    );
+}
+
+#[test]
+fn test_add_script_refuses_project_only_flags() {
+    let dir = script_dir("print(1)\n");
+    for flags in [
+        &["--dev"][..],
+        &["--source", "https://example.org"],
+        &["--no-lock"],
+        &["--no-install"],
+        &["--jobs", "2"],
+        &["--timeout", "1m"],
+        &["--install-system-deps"],
+        &["--no-binary"],
+    ] {
+        uvr_cmd()
+            .args(["add", "cli", "--script", "script.R"])
+            .args(flags)
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        "print(1)\n"
+    );
+}
+
+#[test]
+fn test_remove_script_warns_about_a_missing_name_like_remove_does() {
+    let source = "# /// script\n# dependencies = [\"cli\"]\n# ///\n";
+    let dir = script_dir(source);
+    uvr_ok(&dir, &["remove", "nope", "--script", "script.R"]).stderr(predicate::str::contains(
+        "Package 'nope' not in the script header",
+    ));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn test_a_broken_header_is_not_edited() {
+    let source = "# /// script\n# dependencies = [\"cli\"]\nprint(1)\n";
+    let dir = script_dir(source);
+    for args in [
+        ["add", "zoo", "--script", "script.R"],
+        ["remove", "cli", "--script", "script.R"],
+    ] {
+        uvr_cmd()
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "Invalid script header in script.R",
+            ));
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("script.R")).unwrap(),
+        source
+    );
+}
+
+#[test]
+fn test_what_add_script_writes_is_what_run_reads() {
+    // Every spec kind, offline: `uvr run` accepts the header `uvr add` wrote
+    // and goes on to look for R, which the impossible pin makes fail. So the
+    // error is about R, never about the header.
+    let dir = script_dir("cat(1)\n");
+    uvr_ok(
+        &dir,
+        &[
+            "add",
+            "ggplot2@>=3.4",
+            "jsonlite",
+            "rladies/praise@v1.0.0",
+            "owner/repo#subdirectory=pkgs/inner",
+            "forgejo::codeberg.org/owner/fpkg",
+            "gitlab::gitlab.com/group/gpkg@main",
+            "--script",
+            "script.R",
+        ],
+    );
+    uvr_ok(
+        &dir,
+        &["add", "DESeq2@>=1.40", "--bioc", "--script", "script.R"],
+    );
+    let text = fs::read_to_string(dir.path().join("script.R")).unwrap();
+    assert!(text.contains("\"DESeq2>=1.40 (bioc)\""), "{text}");
+
+    let output = uvr_cmd()
+        .args(["run", "script.R", "--r-version", "99.9.9"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("R not found"), "{stderr}");
+    assert!(!stderr.contains("script header"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_add_script_keeps_an_executable_script_executable() {
+    // The file is replaced by a rename from a 0600 temp file. Unless the
+    // mode is carried over, `./script` with a shebang stops working.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = script_dir("#!/usr/bin/env -S uvr run\nprint(1)\n");
+    let path = dir.path().join("script.R");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    uvr_ok(&dir, &["add", "cli", "--script", "script.R"]);
+    let mode = fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_add_script_edits_a_symlinked_script_at_its_target() {
+    // The file is replaced by a rename, which must land on the link's
+    // target: renaming over the link would turn it into a separate file.
+    let dir = script_dir("print(1)\n");
+    let link = dir.path().join("link.R");
+    std::os::unix::fs::symlink("script.R", &link).unwrap();
+    uvr_ok(&dir, &["add", "cli", "--script", "link.R"]);
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let target = fs::read_to_string(dir.path().join("script.R")).unwrap();
+    assert!(target.contains("#   \"cli\","), "{target}");
+    assert!(target.ends_with("# ///\n\nprint(1)\n"), "{target}");
+}
+
+#[test]
+#[ignore = "requires network access to CRAN/P3M and a managed R"]
+fn test_add_script_then_run() {
+    // #184: the header `uvr add --script` writes is one `uvr run` installs.
+    let cache = TempDir::new().unwrap();
+    let dir = script_dir("cat(jsonlite::toJSON(list(ok = TRUE)))\n");
+    uvr_ok(&dir, &["add", "jsonlite@>=1.8", "--script", "script.R"]);
+    uvr_cmd()
+        .args(["run", "script.R"])
+        .current_dir(dir.path())
+        .env("UVR_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\""));
 }

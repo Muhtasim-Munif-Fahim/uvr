@@ -4,9 +4,18 @@ use clap::builder::styling;
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 
+use uvr_core::manifest::ResolutionStrategy;
+
 use crate::commands::activate::ActivateShell;
 use crate::commands::export::ExportFormat;
 use crate::ide::Ide;
+
+/// `--resolution` values, listed in `--help` and completions.
+fn resolution_parser() -> impl clap::builder::TypedValueParser<Value = ResolutionStrategy> {
+    use clap::builder::TypedValueParser;
+    clap::builder::PossibleValuesParser::new(["highest", "lowest", "lowest-direct"])
+        .map(|s| s.parse().expect("clap accepts only the listed values"))
+}
 
 /// Match the runtime palette: cyan accents for headers/usage, magenta for
 /// literal flag names, yellow for placeholders. Keeps `--help` visually of
@@ -156,6 +165,19 @@ pub struct AddArgs {
     #[arg(required = true, value_name = "PKG[@VERSION|user/repo@REF]")]
     pub packages: Vec<String>,
 
+    /// Add to this R script's inline `# /// script` header instead of the
+    /// project, creating the header if needed. Installs nothing: the next
+    /// `uvr run <FILE>` builds the environment (#184).
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "dev", "source", "no_lock", "no_install", "jobs", "timeout",
+            "install_system_deps", "no_binary", "resolution",
+        ],
+    )]
+    pub script: Option<PathBuf>,
+
     /// Add as dev dependency
     #[arg(long)]
     pub dev: bool,
@@ -189,6 +211,13 @@ pub struct AddArgs {
     #[arg(long)]
     pub no_install: bool,
 
+    /// Version to pick from each allowed range: `highest` (default),
+    /// `lowest`, or `lowest-direct` (lowest for this project's own
+    /// dependencies only). Overrides `[resolution] strategy` in uvr.toml
+    /// for this run.
+    #[arg(long, value_name = "STRATEGY", value_parser = resolution_parser())]
+    pub resolution: Option<ResolutionStrategy>,
+
     /// When missing system libraries are detected, run the platform's
     /// package manager (`apk add` / `apt-get install` / `dnf install`)
     /// to install them automatically (#30). Also enabled by setting
@@ -213,6 +242,11 @@ pub struct RemoveArgs {
     /// Package names to remove
     #[arg(required = true)]
     pub packages: Vec<String>,
+
+    /// Remove from this R script's inline `# /// script` header instead of
+    /// the project; the header goes once it is empty (#184).
+    #[arg(long, value_name = "FILE")]
+    pub script: Option<PathBuf>,
 }
 
 // ────────────────────────────────────────────────────────────
@@ -276,6 +310,13 @@ pub struct SyncArgs {
     /// portable `manylinux` repo.
     #[arg(long)]
     pub no_binary: bool,
+
+    /// Also remove packages that are not in uvr.lock and that uvr did not
+    /// install (#255). By default `uvr sync` removes only unlocked packages
+    /// uvr installed, and keeps what `install.packages()` or another tool
+    /// put into the project library.
+    #[arg(long)]
+    pub prune_all: bool,
 }
 
 // ────────────────────────────────────────────────────────────
@@ -326,6 +367,33 @@ pub struct LockArgs {
     /// Re-resolve and upgrade all packages to their latest allowed versions
     #[arg(long)]
     pub upgrade: bool,
+
+    /// Upgrade only NAME in uvr.lock, holding every other package at its
+    /// locked version (repeatable). Installs nothing — run `uvr sync` after.
+    #[arg(short = 'P', long, value_name = "NAME", conflicts_with = "upgrade")]
+    pub upgrade_package: Vec<String>,
+
+    /// Version to pick from each allowed range: `highest` (default),
+    /// `lowest`, or `lowest-direct` (lowest for this project's own
+    /// dependencies only). Overrides `[resolution] strategy` in uvr.toml
+    /// for this run.
+    #[arg(long, value_name = "STRATEGY", value_parser = resolution_parser())]
+    pub resolution: Option<ResolutionStrategy>,
+
+    /// Resolve CRAN packages as they stood on DATE (YYYY-MM-DD), from
+    /// Posit Package Manager's CRAN snapshot of that day. Overrides
+    /// `[resolution] exclude-newer` in uvr.toml for this run.
+    #[arg(
+        long,
+        value_name = "DATE",
+        value_parser = parse_exclude_newer,
+        conflicts_with = "upgrade_package"
+    )]
+    pub exclude_newer: Option<String>,
+}
+
+fn parse_exclude_newer(s: &str) -> Result<String, String> {
+    uvr_core::registry::cran::snapshot_date(s).map_err(|e| e.to_string())
 }
 
 // ────────────────────────────────────────────────────────────
@@ -344,6 +412,13 @@ pub struct UpdateArgs {
     /// Number of parallel download jobs
     #[arg(short, long, default_value = "50", value_name = "N")]
     pub jobs: usize,
+
+    /// Version to pick from each allowed range: `highest` (default),
+    /// `lowest`, or `lowest-direct` (lowest for this project's own
+    /// dependencies only). Overrides `[resolution] strategy` in uvr.toml
+    /// for this run.
+    #[arg(long, value_name = "STRATEGY", value_parser = resolution_parser())]
+    pub resolution: Option<ResolutionStrategy>,
 }
 
 // ────────────────────────────────────────────────────────────

@@ -92,8 +92,30 @@ pub fn ensure_openmp_shim(r_home: &Path) -> std::io::Result<bool> {
     } else {
         format!("{existing}\n\n{SHIM}")
     };
-    std::fs::write(&profile, updated)?;
+    replace_file(&profile, &updated)?;
     Ok(true)
+}
+
+/// Replace `path` with `content` by renaming a temp file over it, so an R
+/// session starting meanwhile reads the old file or the new one, never a
+/// partial write. Several uvr processes may write these profiles at once.
+fn replace_file(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(content.as_bytes())?;
+    // A temp file is created 0600. Keep the mode the file had, else the
+    // usual 0644, so an R installation other accounts use stays readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(path)
+            .map(|m| m.permissions())
+            .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o644));
+        tmp.as_file().set_permissions(perms)?;
+    }
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Derive `R_HOME` from a path to an R binary (`<r_home>/bin/R`), returning
@@ -154,7 +176,7 @@ pub fn write_runtime_profile(dir: &Path) -> std::io::Result<PathBuf> {
     let content = format!("{RUNTIME_PROFILE_HEADER}{SHIM}");
     if std::fs::read_to_string(&path).ok().as_deref() != Some(content.as_str()) {
         std::fs::create_dir_all(dir)?;
-        std::fs::write(&path, content)?;
+        replace_file(&path, &content)?;
     }
     Ok(path)
 }
@@ -316,6 +338,26 @@ mod tests {
         std::fs::write(&path, "options(warn = 2)\n").unwrap();
         write_runtime_profile(&dir).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_a_profile_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let r_home = fake_r_home(tmp.path(), true);
+        let profile = r_home.join("etc").join("Rprofile.site");
+        std::fs::write(&profile, "options(warn = 1)\n").unwrap();
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o664)).unwrap();
+
+        assert!(ensure_openmp_shim(&r_home).unwrap());
+        let mode = std::fs::metadata(&profile).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o664);
+
+        let dir = tmp.path().join("etc");
+        let path = write_runtime_profile(&dir).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
     }
 
     #[test]

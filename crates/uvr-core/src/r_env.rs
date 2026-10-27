@@ -94,13 +94,20 @@ impl REnv {
     /// Note the deliberately-empty values — `R_LIBS_SITE` and `R_LIBS` are
     /// blanked so a system-wide library cannot leak into a project.
     ///
-    /// **Both** Renviron variables must be blanked. `R_ENVIRON` covers only
-    /// the *site* file; the per-user `~/.Renviron` is gated separately by
+    /// **Both** Renviron variables are blanked by default. `R_ENVIRON` covers
+    /// only the *site* file; the per-user `~/.Renviron` is gated separately by
     /// `R_ENVIRON_USER`, and a user whose `~/.Renviron` sets `R_LIBS_USER`
     /// would otherwise have it silently override the project library. `uvr
     /// run` is additionally protected by its `--no-environ` process flag,
     /// but a sourced activation script has no such flag — so blanking the
     /// variables is what actually does the work here.
+    ///
+    /// `UVR_USER_ENVIRON=1` drops the `R_ENVIRON_USER` blank, restoring the
+    /// user's `~/.Renviron` (#260) — the file holds API tokens and locale
+    /// settings, not just library paths, and blanking it to defend one
+    /// variable takes the rest with it. The site file stays blanked either
+    /// way. `uvr run` drops `--no-environ` to match, or the flag would
+    /// re-suppress what the variable just restored.
     pub fn vars(&self) -> Vec<(&'static str, String)> {
         let r_lib_dir = self.r_lib_dir().to_string_lossy().into_owned();
 
@@ -136,8 +143,10 @@ impl REnv {
             ("DYLD_LIBRARY_PATH", prepend_lib("DYLD_LIBRARY_PATH")),
             ("LD_LIBRARY_PATH", prepend_lib("LD_LIBRARY_PATH")),
             ("R_ENVIRON", String::new()),
-            ("R_ENVIRON_USER", String::new()),
         ];
+        if !crate::env_vars::user_environ() {
+            vars.push(("R_ENVIRON_USER", String::new()));
+        }
 
         // R reads R_LD_LIBRARY_PATH and prepends it to LD_LIBRARY_PATH in
         // every subprocess it spawns (byte-compilation children, `Rscript`
@@ -175,6 +184,26 @@ impl REnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Subprocess tests may need the runner's loader paths to start at all.
+    struct LibraryPathGuard([(&'static str, Option<std::ffi::OsString>); 2]);
+
+    impl LibraryPathGuard {
+        fn new() -> Self {
+            Self(["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"].map(|key| (key, std::env::var_os(key))))
+        }
+    }
+
+    impl Drop for LibraryPathGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     fn renv() -> REnv {
         REnv {
@@ -266,6 +295,7 @@ mod tests {
     #[test]
     fn vars_isolate_the_project_from_system_libraries() {
         let _env = crate::env_vars::env_lock();
+        let _paths = LibraryPathGuard::new();
         // Clear module-provided paths so the test is deterministic.
         std::env::remove_var("LD_LIBRARY_PATH");
         std::env::remove_var("DYLD_LIBRARY_PATH");
@@ -294,6 +324,42 @@ mod tests {
     }
 
     #[test]
+    fn user_environ_opt_in_keeps_the_site_file_blanked() {
+        // #260: `~/.Renviron` carries API tokens, GITHUB_PAT, proxy settings
+        // and locale, not only library paths, so blanking it to defend
+        // R_LIBS_USER takes the rest with it. The opt-out restores the user
+        // file and nothing else — the site file is machine configuration and
+        // stays shadowed.
+        let _env = crate::env_vars::env_lock();
+        std::env::set_var("UVR_USER_ENVIRON", "1");
+        let vars = renv().vars();
+        std::env::remove_var("UVR_USER_ENVIRON");
+
+        assert!(
+            !vars.iter().any(|(k, _)| *k == "R_ENVIRON_USER"),
+            "R_ENVIRON_USER must not be exported at all — a blank value \
+             suppresses the file just as effectively as a wrong one"
+        );
+        assert_eq!(
+            vars.iter()
+                .find(|(k, _)| *k == "R_ENVIRON")
+                .map(|(_, v)| v.as_str()),
+            Some(""),
+            "the site Renviron stays blanked"
+        );
+    }
+
+    #[test]
+    fn user_environ_is_off_by_default() {
+        let _env = crate::env_vars::env_lock();
+        std::env::remove_var("UVR_USER_ENVIRON");
+        let vars = renv().vars();
+        assert!(vars
+            .iter()
+            .any(|(k, v)| *k == "R_ENVIRON_USER" && v.is_empty()));
+    }
+
+    #[test]
     fn vars_prepend_r_lib_dir_to_inherited_ld_library_path() {
         // HPC clusters set LD_LIBRARY_PATH to expose BLAS/LAPACK shared
         // libraries (OpenBLAS, MKL, FlexiBLAS).  `vars()` must prepend R's
@@ -302,6 +368,7 @@ mod tests {
         // and activation scripts.
         let _env = crate::env_vars::env_lock();
         let module_blas = "/apps/rocs/OpenBLAS/lib";
+        let _paths = LibraryPathGuard::new();
         std::env::set_var("LD_LIBRARY_PATH", module_blas);
         std::env::remove_var("DYLD_LIBRARY_PATH");
 
@@ -335,6 +402,7 @@ mod tests {
         // a security hazard.
         let _env = crate::env_vars::env_lock();
         let inherited = "/some/blas/lib";
+        let _paths = LibraryPathGuard::new();
         std::env::set_var("LD_LIBRARY_PATH", inherited);
         std::env::set_var("DYLD_LIBRARY_PATH", inherited);
 

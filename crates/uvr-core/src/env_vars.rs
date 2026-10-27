@@ -76,6 +76,34 @@ pub fn install_timeout() -> Option<String> {
     read_env_var("UVR_INSTALL_TIMEOUT")
 }
 
+/// UVR_SYSREQS_OVERRIDES
+///
+/// Path to an operator-maintained TOML file of installed-provider alternatives.
+/// Unset, empty, and whitespace-only values disable overrides.
+/// Missing or invalid explicitly selected files fail the dependency check.
+///
+/// ```toml
+/// [[overrides]]
+/// distro = "rhel-9.4"
+/// package = "gdal3.4-devel"
+/// installed = "gdal-devel"
+/// pkg_config = "gdal"
+/// minimum_version = "3.4"
+/// ```
+///
+/// Distro IDs are normalized as in host detection: `rhel`/`ol` become `redhat`,
+/// `rocky`/`almalinux` become `rockylinux`, and RHEL-family releases use the major
+/// version. `opensuse-leap-15.6` becomes `opensuse-15.6`, retaining the minor.
+/// Rules target fixed releases; rolling-release snapshot versions must match exactly
+/// and need updating when the host's `VERSION_ID` changes.
+/// The alternative must be installed; optional `pkg_config` and
+/// `minimum_version` fields additionally verify its SDK. A minimum requires
+/// a module. Failed checks retain the catalog requirement, including runtime
+/// packages not explicitly matched by a rule. Duplicate normalized rules fail.
+pub fn sysreqs_overrides() -> Option<PathBuf> {
+    read_env_var("UVR_SYSREQS_OVERRIDES").map(PathBuf::from)
+}
+
 /// UVR_LIBRARY
 ///
 /// Defines a custom library directory in place of the project-local
@@ -88,6 +116,26 @@ pub fn install_timeout() -> Option<String> {
 /// empty.
 pub fn library() -> Option<PathBuf> {
     read_env_var("UVR_LIBRARY").map(PathBuf::from)
+}
+
+/// UVR_USER_ENVIRON
+///
+/// Opt back in to the user's `~/.Renviron` (and a `./.Renviron` beside the
+/// script) inside `uvr run` and a sourced `uvr activate`.
+///
+/// uvr blanks `R_ENVIRON_USER` by default so a `~/.Renviron` setting
+/// `R_LIBS_USER` cannot silently override the project library. That defence
+/// is aimed at one variable but costs the whole file, so API tokens,
+/// `GITHUB_PAT`, proxy settings, TZ and locale all disappear too (#260) —
+/// while `R CMD INSTALL` deliberately keeps them
+/// (`installer/r_cmd_install.rs`). Setting this restores the file for the
+/// run/activate side, and accepts that a `~/.Renviron` which sets
+/// `R_LIBS_USER` will then win over the project library.
+///
+/// The *site* file (`R_ENVIRON`) stays blanked either way: it is machine
+/// configuration rather than the user's, and it is not what #260 asks for.
+pub fn user_environ() -> bool {
+    truthy("UVR_USER_ENVIRON")
 }
 
 /// UVR_NO_COMPANION
@@ -154,6 +202,29 @@ pub fn r_install_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
     dirs::home_dir().map(|h| h.join(".uvr").join("r-versions"))
+}
+
+/// UVR_R_DOWNLOADS
+///
+/// Whether `uvr run` may download R when no installed R satisfies a script
+/// header's `r` constraint (#183). Mirrors uv's `UV_PYTHON_DOWNLOADS`:
+///     - `auto` (default): install the newest matching R and continue.
+///     - `never`: fail, naming the constraint, instead of downloading.
+///
+/// Any other value is an error rather than a silent `auto`: this setting is
+/// for locked-down machines, where a typo must not quietly re-enable
+/// downloads.
+pub fn r_downloads_allowed() -> crate::error::Result<bool> {
+    match read_env_var("UVR_R_DOWNLOADS") {
+        None => Ok(true),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(true),
+            "never" => Ok(false),
+            _ => Err(crate::error::UvrError::Other(format!(
+                "UVR_R_DOWNLOADS={raw:?} is not recognised; use `auto` or `never`"
+            ))),
+        },
+    }
 }
 
 /// UVR_REPOS — comma-separated list of CRAN-like repository URLs to use
@@ -278,6 +349,7 @@ mod tests {
             "UVR_EXTRA_LIBS",
             "UVR_INSTALL_DIR",
             "UVR_INSTALL_TIMEOUT",
+            "UVR_SYSREQS_OVERRIDES",
             "UVR_LIBRARY",
             "UVR_NO_COMPANION",
             "UVR_PACKAGES_DIR",
@@ -298,6 +370,7 @@ mod tests {
         assert_eq!(extra_libs(), None);
         assert_eq!(install_dir(), None);
         assert_eq!(install_timeout(), None);
+        assert_eq!(sysreqs_overrides(), None);
         assert_eq!(library(), None);
         assert!(!no_companion());
         assert!(!unattended());
@@ -320,6 +393,12 @@ mod tests {
 
         env::set_var("UVR_INSTALL_TIMEOUT", "60s");
         assert_eq!(install_timeout(), Some("60s".to_string()));
+
+        env::set_var("UVR_SYSREQS_OVERRIDES", "/custom/sysreqs.toml");
+        assert_eq!(
+            sysreqs_overrides(),
+            Some(PathBuf::from("/custom/sysreqs.toml"))
+        );
 
         env::set_var("UVR_LIBRARY", "/custom/library");
         assert_eq!(library(), Some(PathBuf::from("/custom/library")));
@@ -357,6 +436,7 @@ mod tests {
         for &var in &vars_to_test {
             env::set_var(var, "");
         }
+        assert_eq!(sysreqs_overrides(), None);
 
         let empty_cache = cache_dir();
         assert!(empty_cache.is_some());
@@ -380,6 +460,7 @@ mod tests {
             env::set_var(var, "   ");
         }
         assert_eq!(extra_libs(), None);
+        assert_eq!(sysreqs_overrides(), None);
     }
 
     // #161: the last-resort cache location must never be the working
@@ -436,6 +517,29 @@ mod tests {
         // whitespace-only → None
         env::set_var("UVR_REPOS", "  ");
         assert!(repos().is_none());
+    }
+
+    #[test]
+    fn test_r_downloads_parsing() {
+        let _env = env_lock();
+        let _guard = EnvGuard::new(&["UVR_R_DOWNLOADS"]);
+
+        // Unset, blank and `auto` all allow downloads.
+        assert!(r_downloads_allowed().unwrap());
+        for on in ["", "  ", "auto", "AUTO", " auto "] {
+            env::set_var("UVR_R_DOWNLOADS", on);
+            assert!(r_downloads_allowed().unwrap(), "{on:?} should allow");
+        }
+        for off in ["never", "Never", " never "] {
+            env::set_var("UVR_R_DOWNLOADS", off);
+            assert!(!r_downloads_allowed().unwrap(), "{off:?} should forbid");
+        }
+        // A typo must not fall back to `auto` on a machine that meant `never`.
+        for junk in ["nevr", "0", "false"] {
+            env::set_var("UVR_R_DOWNLOADS", junk);
+            let err = r_downloads_allowed().unwrap_err().to_string();
+            assert!(err.contains("UVR_R_DOWNLOADS"), "{junk:?}: {err}");
+        }
     }
 
     #[test]

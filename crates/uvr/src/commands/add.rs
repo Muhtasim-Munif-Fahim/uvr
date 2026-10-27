@@ -1,226 +1,22 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 
 use uvr_core::error::UvrError;
-use uvr_core::manifest::{DependencySpec, DetailedDep};
+use uvr_core::manifest::{DependencySpec, DetailedDep, ResolutionStrategy};
 use uvr_core::package_name;
 use uvr_core::project::Project;
 use uvr_core::r_version::detector::{find_r_binary, query_r_version};
 use uvr_core::registry::bioconductor::{default_release_for_r, BiocRegistry};
-use uvr_core::registry::forgejo::parse_forgejo_parts;
-use uvr_core::registry::git_generic::parse_git_parts;
-use uvr_core::registry::gitlab::parse_gitlab_parts;
 use uvr_core::resolver::is_base_package;
 
 use crate::ui;
 use crate::ui::palette;
 
-fn split_subdirectory_fragment(raw: &str) -> Result<(&str, Option<&str>)> {
-    let Some((base, fragment)) = raw.split_once('#') else {
-        return Ok((raw, None));
-    };
-    let Some(path) = fragment.strip_prefix("subdirectory=") else {
-        anyhow::bail!(
-            "Unsupported fragment '#{fragment}' in '{raw}'. Expected: \
-             owner/repo[@revision]#subdirectory=path"
-        );
-    };
-    if let Err(e) = uvr_core::subdirectory::validate(path) {
-        anyhow::bail!("{e} (in '{raw}')");
-    }
-    Ok((base, Some(path)))
-}
-
-/// Parse `"pkg@>=1.0.0"`, `"user/repo@ref"`, or `"user/repo@ref#subdirectory=path"` into (name, spec).
+/// Parse one `uvr add` argument — the grammar lives in
+/// [`uvr_core::dep_spec`], shared with script headers.
 fn parse_add_spec(raw: &str, bioc: bool) -> Result<(String, DependencySpec)> {
-    // Any git host: `git::<clone URL>[@ref]` (#190). The URL can contain `/`,
-    // so this comes before the GitHub heuristic too. The name is the
-    // repository name until the DESCRIPTION lookup replaces it.
-    if raw.starts_with("git::") {
-        if raw.contains("#subdirectory=") {
-            anyhow::bail!(
-                "`#subdirectory=` is not supported for git:: sources yet (in '{}').",
-                uvr_core::auth::redact_url(raw)
-            );
-        }
-        let parsed = parse_git_parts(raw).map_err(|reason| {
-            anyhow::anyhow!(
-                "Invalid git spec '{}': {reason}. Expected: git::<clone URL>[@ref], with an \
-                 https://, ssh:// or user@host:path URL",
-                uvr_core::auth::redact_url(raw)
-            )
-        })?;
-        let name = uvr_core::registry::git_generic::repo_name(&parsed.url).to_string();
-        if !package_name::is_valid(&name) {
-            anyhow::bail!("Invalid package name '{name}' extracted from git spec '{raw}'");
-        }
-        let spec = DependencySpec::Detailed(DetailedDep {
-            git: Some(format!("git::{}", parsed.url)),
-            rev: parsed.git_ref,
-            ..Default::default()
-        });
-        return Ok((name, spec));
-    }
-
-    // Direct source tarball (#189). Checked first: a URL contains '/' and
-    // would otherwise be reported as a malformed GitHub spec.
-    if raw.starts_with("https://") || raw.starts_with("http://") {
-        if !uvr_core::registry::url::is_source_tarball_url(raw) {
-            anyhow::bail!(
-                "Unsupported URL '{raw}'. Only direct source tarball URLs ending in .tar.gz or \
-                 .tgz are supported. For a git repository use user/repo[@ref], \
-                 forgejo::host/owner/repo[@ref], or gitlab::host/group/project[@ref]."
-            );
-        }
-        let spec = DependencySpec::Detailed(DetailedDep {
-            url: Some(raw.to_string()),
-            ..Default::default()
-        });
-        return Ok((url_name_hint(raw), spec));
-    }
-
-    // Forgejo: explicit `forgejo::host/owner/repo[@ref]` prefix. Checked
-    // before the bare `user/repo` heuristic below so a forgejo spec
-    // doesn't get misclassified as a malformed GitHub spec.
-    if raw.starts_with("forgejo::") {
-        let Some(parsed) = parse_forgejo_parts(raw) else {
-            anyhow::bail!(
-                "Invalid Forgejo spec '{raw}'. Expected: forgejo::host/owner/repo or forgejo::host/owner/repo@ref"
-            );
-        };
-        let spec = DependencySpec::Detailed(DetailedDep {
-            git: Some(format!(
-                "forgejo::{}/{}/{}",
-                parsed.host, parsed.owner, parsed.repo
-            )),
-            rev: parsed.git_ref,
-            ..Default::default()
-        });
-        return Ok((parsed.repo, spec));
-    }
-
-    // GitLab: explicit `gitlab::host/group[/subgroup...]/project[@ref]`
-    // prefix. Checked before the bare `user/repo` heuristic below for the
-    // same reason as Forgejo above. GitLab projects can live under nested
-    // groups, so the parsed spec carries a full namespace path rather than
-    // a single owner segment.
-    if raw.starts_with("gitlab::") {
-        let Some(parsed) = parse_gitlab_parts(raw) else {
-            anyhow::bail!(
-                "Invalid GitLab spec '{raw}'. Expected: gitlab::host/group/project or gitlab::host/group/subgroup/project[@ref]"
-            );
-        };
-        let name = parsed.project_name().to_string();
-        let spec = DependencySpec::Detailed(DetailedDep {
-            git: Some(format!("gitlab::{}/{}", parsed.host, parsed.project_path)),
-            rev: parsed.git_ref,
-            ..Default::default()
-        });
-        return Ok((name, spec));
-    }
-
-    // GitHub: contains '/'
-    if raw.contains('/') {
-        let (base, subdirectory) = split_subdirectory_fragment(raw)?;
-        let (repo, git_ref) = if let Some(at) = base.rfind('@') {
-            (base[..at].to_string(), Some(base[at + 1..].to_string()))
-        } else {
-            (base.to_string(), None)
-        };
-
-        // Validate user/repo format
-        let parts: Vec<&str> = repo.split('/').collect();
-        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-            // A first segment containing a dot looks like a hostname
-            // (e.g. `gitlab.com/user/repo`, `git.local:3000/u/r`): the real
-            // problem is a missing explicit prefix, not a malformed GitHub
-            // spec — say so instead of the misleading "Invalid GitHub spec"
-            // (#145). Forgejo and GitLab hosts can't be auto-detected from
-            // a bare `host/owner/repo` shape, so both require their `::`
-            // prefix.
-            if parts[0].contains('.') {
-                anyhow::bail!(
-                    "Unsupported git host '{host}' in '{raw}'. Supported specs: \
-                     GitHub via user/repo[@ref], Forgejo via forgejo::host/owner/repo[@ref], \
-                     GitLab via gitlab::host/group/project[@ref], any git host via \
-                     git::https://host/path/repo.git[@ref].",
-                    host = parts[0],
-                );
-            }
-            anyhow::bail!(
-                "Invalid GitHub spec '{raw}'. Expected format: user/repo or user/repo@ref"
-            );
-        }
-
-        let name = match subdirectory {
-            Some(sub) => sub.rsplit('/').next().unwrap_or(sub).to_string(),
-            None => parts[1].to_string(),
-        };
-
-        // Validate package name characters
-        if subdirectory.is_none() && !package_name::is_valid(&name) {
-            anyhow::bail!("Invalid package name '{name}' extracted from GitHub spec '{raw}'");
-        }
-
-        if subdirectory.is_some() {
-            let full = match &git_ref {
-                Some(r) => format!("{repo}@{r}"),
-                None => repo.clone(),
-            };
-            if !uvr_core::registry::github::is_valid_github_repo_spec(&full) {
-                anyhow::bail!(
-                    "Invalid GitHub spec '{raw}'. Expected format: \
-                     owner/repo[@revision]#subdirectory=path"
-                );
-            }
-        }
-
-        let spec = DependencySpec::Detailed(DetailedDep {
-            git: Some(repo),
-            rev: git_ref,
-            subdirectory: subdirectory.map(str::to_string),
-            ..Default::default()
-        });
-        return Ok((name, spec));
-    }
-
-    // CRAN/Bioc with optional version: "pkg@>=1.0.0"
-    let (name, version) = if let Some(at) = raw.find('@') {
-        (raw[..at].to_string(), Some(raw[at + 1..].to_string()))
-    } else {
-        (raw.to_string(), None)
-    };
-
-    // Validate CRAN/Bioc package name
-    if !package_name::is_valid(&name) {
-        anyhow::bail!("Invalid package name '{name}'");
-    }
-
-    let spec = if bioc {
-        DependencySpec::Detailed(DetailedDep {
-            bioc: Some(true),
-            version,
-            ..Default::default()
-        })
-    } else {
-        match version {
-            Some(v) => DependencySpec::Version(v),
-            None => DependencySpec::Version("*".to_string()),
-        }
-    };
-
-    Ok((name, spec))
-}
-
-/// `pkg` from `…/pkg_1.2.0.tar.gz`. A placeholder only: the tarball's
-/// DESCRIPTION names the package, unless `--no-lock` skips the download.
-fn url_name_hint(url: &str) -> String {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let file = path.rsplit('/').next().unwrap_or(path);
-    let stem = file
-        .strip_suffix(".tar.gz")
-        .or_else(|| file.strip_suffix(".tgz"))
-        .unwrap_or(file);
-    stem.split('_').next().unwrap_or(stem).to_string()
+    Ok(uvr_core::dep_spec::parse(raw, bioc)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -233,6 +29,7 @@ pub async fn run(
     timeout: Option<std::time::Duration>,
     no_lock: bool,
     no_install: bool,
+    resolution: Option<ResolutionStrategy>,
 ) -> Result<()> {
     let mut project = Project::find_cwd().context("Not inside a uvr project")?;
 
@@ -323,33 +120,40 @@ pub async fn run(
         );
     }
 
-    // Reject base/recommended packages that ship with R — they can't be installed from CRAN.
-    for (name, _) in &parsed {
-        if is_base_package(name) {
-            anyhow::bail!(
-                "'{}' is a base R package (ships with R itself) and cannot be installed separately.",
-                name
-            );
-        }
-    }
+    reject_base_packages(&parsed)?;
 
     for (name, spec) in &parsed {
-        let is_new = project.manifest.add_dep(name.clone(), spec.clone(), dev);
-        if is_new {
-            println!(
-                "{} {} {}",
-                palette::added(ui::glyph::add()),
-                palette::pkg(name),
-                palette::version(format_spec(spec))
-            );
-        } else {
-            println!(
-                "{} {} {} {}",
+        let (change, spec) = apply_add(&mut project.manifest, name, spec.clone(), dev);
+        let (glyph, note) = match change {
+            AddChange::Added => (palette::added(ui::glyph::add()), None),
+            AddChange::Updated => (palette::upgraded(ui::glyph::change()), Some("(updated)")),
+            AddChange::Kept => (
                 palette::upgraded(ui::glyph::change()),
+                Some("(already in uvr.toml, unchanged)"),
+            ),
+            AddChange::KeptAsRuntime => (
+                palette::upgraded(ui::glyph::change()),
+                Some("(already a runtime dependency, kept in [dependencies])"),
+            ),
+            AddChange::Promoted => (
+                palette::upgraded(ui::glyph::change()),
+                Some("(moved from [dev-dependencies])"),
+            ),
+        };
+        match note {
+            None => println!(
+                "{} {} {}",
+                glyph,
                 palette::pkg(name),
-                palette::version(format_spec(spec)),
-                palette::dim("(updated)"),
-            );
+                palette::version(format_spec(&spec))
+            ),
+            Some(note) => println!(
+                "{} {} {} {}",
+                glyph,
+                palette::pkg(name),
+                palette::version(format_spec(&spec)),
+                palette::dim(note),
+            ),
         }
     }
 
@@ -374,7 +178,8 @@ pub async fn run(
     }
 
     // Re-resolve → update lockfile (and roll back manifest on failure).
-    let mut resolve_result = crate::commands::lock::resolve_and_lock(&project, false).await;
+    let mut resolve_result =
+        crate::commands::lock::resolve_and_lock_with(&project, false, resolution).await;
 
     // A CRAN add that failed only because the package lives on Bioconductor
     // is a question uvr can already answer — so answer it instead of asking
@@ -399,7 +204,9 @@ pub async fn run(
                     project
                         .save_manifest()
                         .context("Failed to write uvr.toml")?;
-                    resolve_result = crate::commands::lock::resolve_and_lock(&project, false).await;
+                    resolve_result =
+                        crate::commands::lock::resolve_and_lock_with(&project, false, resolution)
+                            .await;
                 }
             }
         }
@@ -432,6 +239,179 @@ pub async fn run(
         .await
         .context("Failed to install packages after add")?;
 
+    Ok(())
+}
+
+/// What `uvr add` did with one package.
+#[derive(Debug, PartialEq, Eq)]
+enum AddChange {
+    Added,
+    Updated,
+    /// A plain `uvr add pkg` for a package already listed from the same
+    /// source: its constraint (and the comment beside it) stays as written.
+    Kept,
+    /// `--dev` for a runtime dependency, which already covers development.
+    KeptAsRuntime,
+    /// A dev dependency added without `--dev` becomes a runtime dependency.
+    Promoted,
+}
+
+/// Where a spec gets the package from. A plain `uvr add pkg` keeps an
+/// existing entry only from the same place: `uvr add pkg --bioc` for a CRAN
+/// entry is a request to switch.
+fn spec_channel(spec: &DependencySpec) -> u8 {
+    if spec.url().is_some() {
+        3
+    } else if spec.git().is_some() {
+        2
+    } else if spec.is_bioc() {
+        1
+    } else {
+        0
+    }
+}
+
+/// True for a spec that names no version, ref or URL: `uvr add pkg` or
+/// `uvr add pkg --bioc`.
+fn is_plain_spec(spec: &DependencySpec) -> bool {
+    match spec {
+        DependencySpec::Version(v) => v.trim() == "*",
+        DependencySpec::Detailed(d) => {
+            d.version.is_none() && d.git.is_none() && d.url.is_none() && d.rev.is_none()
+        }
+    }
+}
+
+/// Add `name` to the manifest, returning what changed and the spec that is
+/// now in `uvr.toml`. A package lives in one section only: one already in
+/// `[dependencies]` stays there under `--dev`, and one in
+/// `[dev-dependencies]` moves to `[dependencies]` without it. A plain spec
+/// does not overwrite an existing constraint from the same source.
+fn apply_add(
+    manifest: &mut uvr_core::manifest::Manifest,
+    name: &str,
+    spec: DependencySpec,
+    dev: bool,
+) -> (AddChange, DependencySpec) {
+    let in_runtime = manifest.dependencies.get(name).cloned();
+    let in_dev = manifest.dev_dependencies.get(name).cloned();
+    let existing = in_runtime.clone().or(in_dev.clone());
+    let keep = existing
+        .as_ref()
+        .filter(|old| is_plain_spec(&spec) && spec_channel(old) == spec_channel(&spec))
+        .cloned();
+    let unchanged = keep.is_some() || existing.as_ref() == Some(&spec);
+    let spec = keep.unwrap_or(spec);
+
+    let change = if in_runtime.is_some() {
+        manifest.dependencies.insert(name.to_string(), spec.clone());
+        match (dev, unchanged) {
+            (true, _) => AddChange::KeptAsRuntime,
+            (false, true) => AddChange::Kept,
+            (false, false) => AddChange::Updated,
+        }
+    } else if in_dev.is_some() && !dev {
+        manifest.dev_dependencies.remove(name);
+        manifest.dependencies.insert(name.to_string(), spec.clone());
+        AddChange::Promoted
+    } else if in_dev.is_some() {
+        manifest
+            .dev_dependencies
+            .insert(name.to_string(), spec.clone());
+        if unchanged {
+            AddChange::Kept
+        } else {
+            AddChange::Updated
+        }
+    } else {
+        manifest.add_dep(name.to_string(), spec.clone(), dev);
+        AddChange::Added
+    };
+    (change, spec)
+}
+
+/// `uvr add --script`: add `packages` to the script's inline header (#184).
+///
+/// Nothing is resolved or installed, as with `uv add --script`: the next
+/// `uvr run` builds the environment from the header. A git package keeps
+/// the name its URL gives, with no DESCRIPTION lookup, because the header
+/// stores only the spec and `uvr run` names it the same way.
+pub fn run_script(path: &Path, packages: &[String], bioc: bool) -> Result<()> {
+    let parsed: Vec<(String, DependencySpec)> = packages
+        .iter()
+        .map(|p| parse_add_spec(p, bioc))
+        .collect::<Result<Vec<_>>>()?;
+    reject_base_packages(&parsed)?;
+
+    // As in a project, a plain `uvr add pkg` keeps the constraint a header
+    // entry from the same source already has.
+    let mut parsed = parsed;
+    let mut kept: Vec<String> = Vec::new();
+    let (before, changed) = crate::commands::util::edit_script_header(path, |source| {
+        if let Ok(Some(header)) = uvr_core::script_header::parse(source) {
+            for (name, spec) in parsed.iter_mut() {
+                let existing = header.dependencies.iter().find(|(n, _)| n == name);
+                if let Some((_, old)) = existing.filter(|(_, old)| {
+                    is_plain_spec(spec) && spec_channel(old) == spec_channel(spec)
+                }) {
+                    *spec = old.clone();
+                    kept.push(name.clone());
+                }
+            }
+        }
+        uvr_core::script_header::upsert(source, &parsed)
+    })?;
+    for (name, spec) in &parsed {
+        if kept.contains(name) {
+            println!(
+                "{} {} {} {}",
+                palette::upgraded(ui::glyph::change()),
+                palette::pkg(name),
+                palette::version(format_spec(spec)),
+                palette::dim("(already in the header, unchanged)"),
+            );
+        } else if before.contains(name) {
+            println!(
+                "{} {} {} {}",
+                palette::upgraded(ui::glyph::change()),
+                palette::pkg(name),
+                palette::version(format_spec(spec)),
+                palette::dim("(updated)"),
+            );
+        } else {
+            println!(
+                "{} {} {}",
+                palette::added(ui::glyph::add()),
+                palette::pkg(name),
+                palette::version(format_spec(spec))
+            );
+        }
+    }
+    let verb = if changed.is_some() {
+        "Updated"
+    } else {
+        "No change to"
+    };
+    ui::summary(
+        format!("{verb} the script header in {}", path.display()),
+        format!(
+            "Nothing installed yet: `uvr run {}` builds its environment.",
+            path.display()
+        ),
+    );
+    Ok(())
+}
+
+/// Refuse packages that ship with R: no repository serves them.
+fn reject_base_packages(parsed: &[(String, DependencySpec)]) -> Result<()> {
+    for (name, _) in parsed {
+        if is_base_package(name) {
+            anyhow::bail!(
+                "'{}' is a base R package (ships with R itself) and cannot be installed separately.",
+                name
+            );
+        }
+    }
     Ok(())
 }
 
@@ -564,7 +544,7 @@ async fn probe_bioc(project: &Project, name: &str) -> Option<bool> {
 /// in the batch fails, surface a single user-facing warn so an offline
 /// user knows manifest names may need a manual touch-up. A `subdirectory`
 /// spec is the exception: a failed lookup errors instead.
-async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Result<()> {
+pub(crate) async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Result<()> {
     use uvr_core::auth::GitHost;
     use uvr_core::registry::github::parse_github_spec;
 
@@ -751,7 +731,7 @@ async fn resolve_git_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Resul
 /// Download each URL spec (#189), reject anything that is not an R source
 /// tarball, and key it by its DESCRIPTION `Package:`. Unlike the git lookup
 /// above this is not best-effort: the download is the validation.
-async fn resolve_url_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Result<()> {
+pub(crate) async fn resolve_url_pkg_names(parsed: &mut [(String, DependencySpec)]) -> Result<()> {
     if parsed.iter().all(|(_, spec)| spec.url().is_none()) {
         return Ok(());
     }
@@ -797,6 +777,80 @@ fn format_spec(spec: &DependencySpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_with(deps: &[(&str, &str)], dev: &[(&str, &str)]) -> uvr_core::manifest::Manifest {
+        let mut m = uvr_core::manifest::Manifest::new("t", None);
+        for (n, v) in deps {
+            m.add_dep(n.to_string(), DependencySpec::Version(v.to_string()), false);
+        }
+        for (n, v) in dev {
+            m.add_dep(n.to_string(), DependencySpec::Version(v.to_string()), true);
+        }
+        m
+    }
+
+    fn version(v: &str) -> DependencySpec {
+        DependencySpec::Version(v.into())
+    }
+
+    #[test]
+    fn plain_add_keeps_an_existing_constraint() {
+        let mut m = manifest_with(&[("dplyr", ">=1.1.0")], &[]);
+        let (_, spec) = parse_add_spec("dplyr", false).unwrap();
+        let (change, kept) = apply_add(&mut m, "dplyr", spec, false);
+        assert_eq!(change, AddChange::Kept);
+        assert_eq!(kept, version(">=1.1.0"));
+        assert_eq!(m.dependencies["dplyr"], version(">=1.1.0"));
+
+        // A new constraint still replaces it.
+        let (_, spec) = parse_add_spec("dplyr@>=1.2.0", false).unwrap();
+        assert_eq!(
+            apply_add(&mut m, "dplyr", spec, false).0,
+            AddChange::Updated
+        );
+        assert_eq!(m.dependencies["dplyr"], version(">=1.2.0"));
+    }
+
+    #[test]
+    fn plain_add_from_another_source_switches_it() {
+        let mut m = manifest_with(&[("limma", ">=3.0")], &[]);
+        let (_, spec) = parse_add_spec("limma", true).unwrap();
+        let (change, now) = apply_add(&mut m, "limma", spec, false);
+        assert_eq!(change, AddChange::Updated);
+        assert!(now.is_bioc());
+        assert!(m.dependencies["limma"].is_bioc());
+    }
+
+    #[test]
+    fn dev_add_of_a_runtime_dependency_does_not_duplicate_it() {
+        let mut m = manifest_with(&[("dplyr", ">=1.1.0")], &[]);
+        let (_, spec) = parse_add_spec("dplyr", false).unwrap();
+        assert_eq!(
+            apply_add(&mut m, "dplyr", spec, true).0,
+            AddChange::KeptAsRuntime
+        );
+        assert!(!m.dev_dependencies.contains_key("dplyr"));
+        assert_eq!(m.dependencies["dplyr"], version(">=1.1.0"));
+    }
+
+    #[test]
+    fn runtime_add_of_a_dev_dependency_moves_it() {
+        let mut m = manifest_with(&[], &[("testthat", ">=3.0.0")]);
+        let (_, spec) = parse_add_spec("testthat", false).unwrap();
+        let (change, spec) = apply_add(&mut m, "testthat", spec, false);
+        assert_eq!(change, AddChange::Promoted);
+        assert_eq!(spec, version(">=3.0.0"));
+        assert!(!m.dev_dependencies.contains_key("testthat"));
+        assert_eq!(m.dependencies["testthat"], version(">=3.0.0"));
+
+        let mut m = manifest_with(&[], &[("testthat", "*")]);
+        let (_, spec) = parse_add_spec("testthat@>=3.2.0", false).unwrap();
+        assert_eq!(
+            apply_add(&mut m, "testthat", spec, true).0,
+            AddChange::Updated
+        );
+        assert_eq!(m.dev_dependencies["testthat"], version(">=3.2.0"));
+    }
 
     #[test]
     fn parse_cran() {
@@ -907,6 +961,88 @@ mod tests {
         }
     }
 
+    fn detailed(spec: DependencySpec) -> DetailedDep {
+        match spec {
+            DependencySpec::Detailed(d) => d,
+            other => panic!("expected Detailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_remotes_style_subdirectory_specs_match_the_fragment_form() {
+        // #312: the slash and colon forms of DESCRIPTION `Remotes:` give
+        // the same dependency as `#subdirectory=`.
+        for (raw, fragment, want_name) in [
+            (
+                "REditorSupport/vscode-R:sess@main",
+                "REditorSupport/vscode-R@main#subdirectory=sess",
+                "sess",
+            ),
+            (
+                "REditorSupport/vscode-R/sess@main",
+                "REditorSupport/vscode-R@main#subdirectory=sess",
+                "sess",
+            ),
+            (
+                "owner/repo/pkgs/nested",
+                "owner/repo#subdirectory=pkgs/nested",
+                "nested",
+            ),
+            (
+                "owner/repo:pkgs/nested@v1.0",
+                "owner/repo@v1.0#subdirectory=pkgs/nested",
+                "nested",
+            ),
+        ] {
+            let (name, spec) =
+                parse_add_spec(raw, false).unwrap_or_else(|e| panic!("should accept {raw}: {e}"));
+            let (fragment_name, fragment_spec) = parse_add_spec(fragment, false).unwrap();
+            assert_eq!(name, want_name, "{raw}");
+            assert_eq!(name, fragment_name, "{raw}");
+            assert_eq!(detailed(spec), detailed(fragment_spec), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_ref_goes_last_and_can_contain_a_slash() {
+        // Same rule as `Remotes:`: the ref follows the first `@`, so
+        // `owner/repo@ref/sub` is a branch named `ref/sub`, not a directory.
+        let d = detailed(parse_add_spec("owner/repo@feature/x", false).unwrap().1);
+        assert_eq!(d.git.as_deref(), Some("owner/repo"));
+        assert_eq!(d.rev.as_deref(), Some("feature/x"));
+        assert_eq!(d.subdirectory, None);
+    }
+
+    #[test]
+    fn parse_rejects_bad_remotes_style_subdirectories() {
+        for bad in [
+            "owner/repo/",
+            "owner/repo:",
+            "owner/repo/a:b",
+            "owner/repo/../escape",
+            "owner/repo:sub@",
+            "owner/repo:sub#subdirectory=other",
+            "owner/repo/sub#subdirectory=other",
+        ] {
+            assert!(parse_add_spec(bad, false).is_err(), "should reject {bad}");
+        }
+    }
+
+    #[test]
+    fn parse_keeps_the_host_error_for_host_like_first_segments() {
+        // #145: a first segment with a `.` is a host, also when the rest
+        // looks like a GitHub subdirectory spec.
+        for raw in [
+            "gitlab.com/user/repo",
+            "gitlab.com/user/repo:sub",
+            "gitlab.com/user/repo/sub@main",
+            "git.local:3000/u/r",
+        ] {
+            let err = parse_add_spec(raw, false).unwrap_err().to_string();
+            assert!(err.contains("Unsupported git host"), "{raw}: {err}");
+        }
+    }
+
     #[test]
     fn parse_rejects_subdirectory_on_non_github_hosts() {
         for bad in [
@@ -948,7 +1084,8 @@ mod tests {
     fn parse_invalid_github() {
         assert!(parse_add_spec("/", false).is_err());
         assert!(parse_add_spec("a//b", false).is_err());
-        assert!(parse_add_spec("user/repo/extra", false).is_err());
+        // `user/repo/extra` is now the package directory `extra` (#312).
+        assert!(parse_add_spec("user//extra", false).is_err());
     }
 
     #[test]
@@ -1025,10 +1162,10 @@ mod tests {
     #[test]
     fn parse_non_host_bad_spec_keeps_github_error() {
         // No dot in the first segment → still the plain GitHub-spec error.
-        let msg = parse_add_spec("user/repo/extra", false)
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("Invalid GitHub spec"), "unexpected: {msg}");
+        for raw in ["user//extra", "user/repo/", "user/repo:"] {
+            let msg = parse_add_spec(raw, false).unwrap_err().to_string();
+            assert!(msg.contains("Invalid GitHub spec"), "{raw}: {msg}");
+        }
     }
 
     #[test]

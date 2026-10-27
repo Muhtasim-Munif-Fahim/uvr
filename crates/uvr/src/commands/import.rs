@@ -79,11 +79,13 @@ pub async fn run(
     let renv_lock: RenvLock =
         serde_json::from_str(&content).context("Failed to parse renv.lock as JSON")?;
 
-    // Extract R version
+    // Extract R version. renv.lock records the R the lock was made with, not
+    // a requirement: write it as a floor, since a bare version in uvr.toml
+    // pins R exactly (#320) and the recorded R is rarely the one installed.
     let r_version = if renv_lock.r.version.is_empty() {
         None
     } else {
-        Some(renv_lock.r.version.clone())
+        Some(format!(">={}", renv_lock.r.version))
     };
 
     let cwd = std::env::current_dir().context("Cannot determine current directory")?;
@@ -219,6 +221,7 @@ pub async fn run(
     // Create .uvr/library/
     let library_path = cwd.join(DOT_UVR_DIR).join(LIBRARY_DIR);
     std::fs::create_dir_all(&library_path).context("Failed to create .uvr/library/")?;
+    uvr_core::project::ensure_dot_uvr_ignored(&cwd).context("Failed to write .uvr/.gitignore")?;
 
     // Mirror the scaffolding `uvr init` writes — without these, a user
     // migrating from renv ends up with `uvr.toml` but no `.Rprofile`
@@ -237,7 +240,7 @@ pub async fn run(
             }
             init::ensure_rprofile(&cwd).context("Failed to write .Rprofile")?;
             if ide.is_positron() {
-                init::ensure_positron_settings(&cwd)
+                init::ensure_positron_settings(&cwd, manifest.project.r_version.as_deref())
                     .context("Failed to write Positron settings")?;
             }
         }

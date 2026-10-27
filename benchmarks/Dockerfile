@@ -33,8 +33,9 @@ ARG R_VERSION=4.5.3
 # is rebuilt on every release. Bumped over time as transitive deps
 # raise their minimum rustc: 1.83 → 1.86 (May 2026, `edition2024` /
 # Cargo 1.85) → 1.88 (May 2026, `home@0.5.12`, `time@0.3.47`,
-# `time-core@0.1.8` all require rustc 1.88).
-FROM rust:1.88.0-slim-bookworm AS builder
+# `time-core@0.1.8` all require rustc 1.88) → 1.94 (Oct 2026, `aes@0.9.3`
+# via zip 9 requires 1.89; 1.94 is what CI and releases build with).
+FROM rust:1.94.0-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config musl-tools \

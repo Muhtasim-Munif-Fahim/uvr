@@ -221,6 +221,7 @@ uvr add DESeq2 --bioc
 uvr add tidymodels@>=1.0.0
 uvr add user/repo@main
 uvr add 'user/monorepo@main#subdirectory=packages/nestedPkg'
+uvr add user/monorepo/packages/nestedPkg@main   # same as the line above
 uvr add git::https://git.example.com/team/anyPkg.git@v1.0   # any git host
 uvr add https://example.org/builds/mypkg_1.2.0.tar.gz
 
@@ -234,9 +235,12 @@ uvr run analysis.R -- --input data.csv
 uvr tree
 ```
 
-GitHub package directories also propagate through supported DESCRIPTION
-`Remotes:` entries, including `owner/repo/subdir@ref` and
-`owner/repo:subdir@ref`. This traversal follows the source chain: only a
+`uvr add` accepts a GitHub package directory in three forms:
+`owner/repo[@ref]#subdirectory=subdir`, `owner/repo/subdir[@ref]` and
+`owner/repo:subdir[@ref]`. The ref always goes last, so `owner/repo@feat/x` is
+the branch `feat/x`, not a directory. GitHub package directories also propagate
+through supported DESCRIPTION `Remotes:` entries, including
+`owner/repo/subdir@ref` and `owner/repo:subdir@ref`. This traversal follows the source chain: only a
 package already selected from a manifest Git source can introduce another
 remote source; ordinary registry packages cannot inject remote URLs. Bound
 aliases and subdirectory targets fail rather than falling back to a registry
@@ -262,15 +266,21 @@ or to the repository root.
 | `uvr sync --unattended` | CI mode: skip IDE config, companion, and working-tree writes |
 | `uvr sysdeps` | Report missing system dependencies without installing anything |
 | `uvr sysdeps --all` | List every system dependency, installed or not |
+| `uvr sync --prune-all` | Also remove packages that are not in `uvr.lock` and that uvr did not install (by default, `sync` keeps packages that `install.packages()` or other tools put into the project library) |
 | `uvr update [pkg...]` | Upgrade packages to latest allowed versions |
 | `uvr update --dry-run` | Show what would change without installing |
 | `uvr lock` | Re-resolve all deps and update `uvr.lock` without installing |
 | `uvr lock --upgrade` | Upgrade all packages to their latest allowed versions |
+| `uvr lock --upgrade-package <pkg>` | Upgrade only `<pkg>` in `uvr.lock` (repeatable, short `-P`), holding every other package at its locked version; installs nothing |
+| `uvr lock --resolution lowest` | Resolve to the oldest versions the constraints allow, to test declared floors (also on `add` and `update`; see [`[resolution]`](#resolution-strategy)) |
+| `uvr lock --exclude-newer 2024-01-01` | Resolve CRAN packages as they were on a date (see [Resolve as of a date](#resolve-as-of-a-date)) |
 | `uvr tree` | Show the dependency tree |
 | `uvr tree --depth 1` | Show only direct dependencies |
 | `uvr run [script.R]` | Run a script (or interactive R) with the project library active |
 | `uvr run --with pkg` | Run with extra packages available (not added to manifest) |
 | `uvr run script.R` | Run a standalone script from its inline `# /// script` dependency header — outside any project |
+| `uvr add <pkg...> --script script.R` | Add packages to a script's inline header, creating it if needed (installs nothing) |
+| `uvr remove <pkg...> --script script.R` | Remove packages from a script's inline header, dropping it once empty |
 | `uvr activate` | Print how to activate the project in your shell (`source .uvr/activate`) |
 | `uvr r install <ver>` | Download and install a specific R version to `~/.uvr/r-versions/` (override the location with `--install-dir`) |
 | `uvr r install devel` | Install a rolling channel — `devel` or `next`, rebuilt continuously and marked `[unstable]` (not reproducible; don't pin one) |
@@ -334,20 +344,78 @@ v Installed 2 package(s) in 1.75s
 You are epic!
 ```
 
-The dependencies install into a cached environment keyed by the dependency
-set, so the second run of that script — or any other script wanting the same
-packages — starts immediately. Nothing is written next to the script.
+Each entry takes the same specs as `uvr add`, so a shared script can pin
+what it needs:
+
+```r
+# /// script
+# dependencies = [
+#   "ggplot2>=3.4",                        # version constraint (or ggplot2@>=3.4)
+#   "DESeq2 (bioc)",                       # Bioconductor — the header's --bioc
+#   "rladies/praise@v1.0.0",               # GitHub, optional @ref
+#   "forgejo::codeberg.org/owner/pkg",     # Forgejo
+#   "gitlab::gitlab.com/group/pkg@main",   # GitLab
+# ]
+# ///
+```
+
+You can keep the header up to date from the command line, as with
+`uv add --script`:
+
+```console
+$ uvr add jsonlite 'ggplot2>=3.4' --script analysis.R
+$ uvr add DESeq2 --bioc --script analysis.R
+$ uvr remove ggplot2 --script analysis.R
+```
+
+`uvr add --script` creates the header if the file has none (after the shebang
+line, if there is one). It replaces the spec of a package that is already
+listed, adds new entries in the spellings shown above, and keeps a sorted list
+sorted. Only the `dependencies` lines change: other keys, comments, line
+endings and the rest of the file stay as they are. `uvr remove --script`
+deletes the header when nothing is left in it. Neither command reads or writes
+`uvr.toml` or `uvr.lock`, and neither installs anything: the next `uvr run`
+builds the environment. `--bioc` applies as usual; the project-only flags
+(`--dev`, `--source`, `--no-lock`, `--no-install` and the install options)
+are refused.
+
+The dependencies install into a cached environment keyed by the R version
+and the full specs, so the second run of that script — or any other script
+wanting the same packages — starts immediately, while two headers that differ
+only by a version or ref get separate environments. Nothing is written next
+to the script.
 
 The header is the R analogue of Python's [PEP 723](https://peps.python.org/pep-0723/)
-inline script metadata, which `uv run` uses. It must start at column zero,
-may follow a shebang or banner comment, and takes plain package names today
-(version constraints, Bioconductor and git sources are planned). A malformed
-or duplicated header is an error naming the file and the problem, never
-silently ignored.
+inline script metadata, which `uv run` uses. It must start at column zero and
+may follow a shebang or banner comment. A malformed or duplicated header, or
+an entry `uvr add` would refuse, is an error naming the file and the problem,
+never silently ignored.
 
 Scripts run isolated from any project you happen to be standing in: the
 project library, its `.r-version` pin, and its `.Rprofile` are all bypassed,
 so a script behaves the same wherever it is invoked from.
+
+A header can also say which R the script needs:
+
+```r
+# /// script
+# r = "~4.4"
+# dependencies = ["jsonlite"]
+# ///
+```
+
+`r` takes the same constraint grammar as `r_version` in `uvr.toml`. uvr runs
+the script with the newest installed R that satisfies it. If none does, uvr
+installs the newest matching R that is published for your platform (the same
+download as `uvr r install`, with its progress on stderr) and continues. As in
+`uvr.toml`, a bare version is a pin: `r = "4.4"` means any 4.4.x and
+`r = "4.4.3"` means that release. Write `>=4.4` (or `^4.4`) to accept newer
+minors. `uvr run --r-version <constraint>` overrides the header, and never
+installs anything.
+
+To stop uvr from downloading R, for example on a locked-down machine, set
+`UVR_R_DOWNLOADS=never` (the default is `auto`). A script whose `r` no
+installed R satisfies then fails with an error that names the constraint.
 
 A script can also carry a shebang and run as a plain executable:
 
@@ -386,6 +454,11 @@ R                         # uses the project's R and .uvr/library/
 deactivate                # restore your shell
 ```
 
+If another tool already owns the name `deactivate` — a Python virtual
+environment, for example — uvr leaves that function alone and says so when you
+activate. Use `uvr_deactivate` there; it always works, whichever shell you use,
+and it restores only what uvr changed.
+
 `uvr init` writes these files (`uvr activate --write-shim` recreates them).
 They contain **no paths**: each one asks uvr to recompute the environment as
 it is sourced, so changing the project's R version with `uvr r use` or
@@ -404,6 +477,22 @@ or per-shell, which overrides the manifest either way:
 ```sh
 export UVR_ACTIVATE_PROMPT=1   # or 0 to opt out of a project that opts in
 ```
+
+### The user's `.Renviron`
+
+`uvr run` and a sourced activation both shadow `~/.Renviron`, so a
+`~/.Renviron` that sets `R_LIBS_USER` cannot silently replace the project
+library. That also hides everything else the file holds — API tokens,
+`GITHUB_PAT`, proxy settings, locale. To read it again:
+
+```sh
+export UVR_USER_ENVIRON=1
+```
+
+The site-wide `Renviron.site` stays shadowed either way. With the opt-out on,
+a `~/.Renviron` that sets `R_LIBS_USER` does override the project library —
+that is the trade the switch makes. `R CMD INSTALL` has always read the user
+file, so `uvr add` and `uvr sync` are unaffected by this setting.
 
 ---
 
@@ -505,6 +594,10 @@ tarPkg = { url = "https://example.org/builds/tarPkg_1.2.0.tar.gz" }
 testthat = "*"
 ```
 
+`r_version` takes a requirement (`">=4.3.0"`, `"^4.5"`, `"==4.5.3"`) or a bare
+version, which pins R like `.r-version` does: `"4.5.3"` selects exactly R
+4.5.3, and `"4.5"` selects the newest installed 4.5.x.
+
 A `url` dependency is a source package tarball (`.tar.gz` or `.tgz`) at a fixed
 URL, such as an internal build artifact or an archived release. `uvr lock`
 downloads it, checks that it is an R source package (not a built binary), and
@@ -553,6 +646,13 @@ export UVR_REPO_PASSWORD_INTERNAL_PPM=...
 
 - `<NAME>` is the source `name` with any `:port` suffix removed, in upper case, and with each character that is not a letter or digit changed to `_` (`internal-ppm` → `INTERNAL_PPM`). For `uvr add --source <url>` and `UVR_REPOS`, the name is the URL host (`ppm.corp.example:8443` → `PPM_CORP_EXAMPLE`).
 - If the token is set, uvr uses it and ignores the user and password. uvr removes spaces at the start and end of each value. An empty value counts as not set.
+- **Pin the host.** The variables are keyed by the repository name, and a project you clone chooses its own names and URLs. Set `UVR_REPO_HOST_<NAME>` to the repository's host, and uvr sends the variables only to URLs on that host:
+
+  ```sh
+  export UVR_REPO_HOST_INTERNAL_PPM=ppm.corp.example   # or ppm.corp.example:8443 to pin the port too
+  ```
+
+  A `uvr.toml` that points `internal-ppm` at another host then gets nothing from these variables, and uvr warns. Without the pin, any project that uses the name `internal-ppm` gets the credential. `~/.netrc` entries are keyed by host already.
 - uvr sends the credential with the index (`PACKAGES.gz`) request and with each package download, but only to URLs under the source `url`. When a redirect goes to a different host or port, uvr does not send it. uvr never shows it in output (`-v` included), and does not pass it to `R CMD INSTALL`.
 - If none of these variables is set, uvr uses the `~/.netrc` entry for the repository host, with HTTP basic auth:
 
@@ -575,16 +675,121 @@ export UVR_REPO_PASSWORD_INTERNAL_PPM=...
 | Host | Variables, in order |
 |---|---|
 | GitHub | `GITHUB_PAT`, `GITHUB_TOKEN` |
-| GitLab | `UVR_GITLAB_TOKEN_<HOST>`, `UVR_GITLAB_TOKEN` |
-| Forgejo | `UVR_FORGEJO_TOKEN_<HOST>`, `UVR_FORGEJO_TOKEN` |
+| GitLab | `UVR_GITLAB_TOKEN_<HOST>`, then `UVR_GITLAB_TOKEN` for `gitlab.com` only |
+| Forgejo | `UVR_FORGEJO_TOKEN_<HOST>`, then `UVR_FORGEJO_TOKEN` for `codeberg.org` only |
 | Any other host (`git::`) | `UVR_GIT_TOKEN_<HOST>` |
 
-- `<HOST>` is the host, changed as `<NAME>` is above (`git.local:3000` → `GIT_LOCAL`).
+- `<HOST>` is the host name without its port, in capitals, with each `.` written as `_` and each `-` written as `__`: `git.local:3000` → `GIT_LOCAL`, `my-gitlab.example` → `MY__GITLAB_EXAMPLE`. One variable name matches exactly one host, so a project that names a lookalike host (`git-corp.com` for `git.corp.com`) cannot get your token. A host name with other characters (an IPv6 address, `_`) has no variable; use `~/.netrc`.
+- `UVR_GITLAB_TOKEN` and `UVR_FORGEJO_TOKEN` go only to `gitlab.com` and `codeberg.org`. Every other host is named by the dependency, so a cloned project could otherwise collect the token by naming a host of its own. For a self-hosted instance, set its own `<HOST>` variable. uvr warns when one of these variables is set but not used for a host.
 - If none of these variables is set, uvr uses the `password` of the `~/.netrc` entry for the host (for GitHub, `machine github.com`). The password must be an access token, not your account password.
 - uvr sends the token with the API requests, the `DESCRIPTION` request and the tarball download (GitHub and GitLab: `Authorization: Bearer`, Forgejo: `Authorization: token`). uvr sends it only to that host: for GitHub, `api.github.com` and `raw.githubusercontent.com`. uvr never sends it to CRAN, P3M, a `[[sources]]` repository, or a different git host.
 - If a host refuses a netrc password (`401`, or `404` from `raw.githubusercontent.com`), uvr shows a warning and does not use that entry again in the same run. uvr then continues without credentials, so public repositories still work. uvr never ignores a token from a variable: if the host refuses it, uvr stops with an error.
 - For a `git::` dependency, git servers take HTTP basic auth, so uvr sends the token as the password. The user name is `UVR_GIT_USER_<HOST>`, or `x-token-auth` if that is not set (Bitbucket Cloud access tokens need that name; GitLab accepts any name). From `~/.netrc`, uvr uses the `login` and `password` of the entry. uvr gives the header to git in `GIT_CONFIG_*` environment variables, which need git 2.31 or later, and never on the command line. git sends it only to the `https://` origin of the URL. There is no variable for all `git::` hosts, because it would send one token to every host that a dependency names.
 - If uvr has no token for a `git::` host, git uses its own credential helpers. For `ssh://` and `user@host:path` URLs, git uses your ssh keys and agent, and uvr sends nothing. uvr turns off the terminal prompts of git, so a private repository without credentials fails instead of waiting for input.
+
+#### Resolution strategy
+
+```toml
+[resolution]
+strategy = "lowest-direct"   # "highest" (default), "lowest", or "lowest-direct"
+```
+
+The strategy selects which end of each allowed version range uvr uses:
+
+- `highest` (the default) uses the newest release.
+- `lowest` uses the oldest release that each constraint allows, for all
+  packages. Thus `ggplot2 = ">=3.4.0"` resolves to ggplot2 3.4.0, and you can
+  test that floor. A package that no constraint limits resolves to its first
+  CRAN release, which frequently does not build on a current R.
+- `lowest-direct` uses the oldest release for the dependencies in `uvr.toml`,
+  and the newest release for the packages that they pull in. Use this mode to
+  check your own floors in CI.
+
+`--resolution <strategy>` on `uvr lock`, `uvr add`, and `uvr update` overrides
+the setting for one run. uvr does not store the override. The next resolution
+(after a change to `uvr.toml`, such as `uvr add`, or with `uvr lock --upgrade`)
+uses the `uvr.toml` setting again. Thus, to keep a strategy, write it in
+`uvr.toml`. `uvr sync --frozen` compares the lockfile with `uvr.toml`, so a
+change of the setting there makes the lockfile stale.
+
+CRAN's package index lists only current releases. For the older releases,
+uvr gets the metadata from [crandb](https://crandb.r-pkg.org) (METACRAN),
+keeps it in `~/.uvr/cache/cran-history/`, and downloads the tarballs from the
+CRAN archive. There are no P3M binaries for old releases, thus `uvr sync`
+builds them from source. uvr does not use a release that needs a package that
+is no longer on CRAN. Bioconductor packages and custom repositories resolve
+from their index without change (a Bioconductor release has one version of
+each package). Git dependencies stay at the commit that they name.
+
+#### Resolve as of a date
+
+```toml
+[resolution]
+exclude-newer = "2024-01-01"   # YYYY-MM-DD
+```
+
+`exclude-newer` resolves CRAN packages as they were on that date, so that you
+can reproduce an analysis as it was then. uvr reads the CRAN index from the
+[Posit Package Manager](https://packagemanager.posit.co) snapshot for that day
+(`https://packagemanager.posit.co/cran/<DATE>`), and records the date in
+`uvr.lock` as `resolved_as_of`. `uvr sync` downloads the source tarballs and
+the P3M binaries from the same snapshot. The first snapshot is 2017-10-10, and
+a date in the future is an error.
+
+- The snapshot shows CRAN as Package Manager copied it on that day. Package
+  Manager can be some days behind CRAN, thus a release that CRAN published a
+  short time before the date can be absent.
+- `--exclude-newer <DATE>` on `uvr lock` sets the date without editing
+  `uvr.toml`. The date is kept in `uvr.lock`: later `uvr add`, `uvr remove`,
+  `uvr lock -P` and `uvr update <pkg>` runs resolve at the same date, until
+  `uvr.toml` names a date or `uvr lock --upgrade` resolves against today's
+  CRAN. To share the date with collaborators, write it in `uvr.toml`. When
+  `uvr.toml` names a date, `uvr sync --frozen` fails if `uvr.lock` was
+  resolved at another one.
+- With `--resolution lowest`, releases that are older than the snapshot's
+  release download from the CRAN archive, where their MD5 checksum applies.
+- Bioconductor packages, `[[sources]]` repositories, and git dependencies have
+  no dated snapshot. uvr shows one warning that names them, and resolves them
+  from their current state.
+- `UVR_REPOS` has no effect on the date: lock time does not read it, and at
+  sync time a mirror supplies only a binary of the exact locked version.
+
+#### Overrides and constraints
+
+```toml
+[override-dependencies]
+rlang = "1.0.6"       # use this version, whatever a package requires
+
+[constraint-dependencies]
+cli = "<3.6.6"        # applies only if a dependency pulls in cli
+```
+
+An override is an exact version, in R's form (`"1.6-5"` is correct). It
+replaces every requirement on that package, including the requirement in
+`[dependencies]`. Use it when a package requires a version that you cannot
+use. `uvr lock -v` shows the version that each override selects and each
+requirement that it ignores:
+
+```
+DEBUG override rlang = "1.0.6" selects rlang 1.0.6
+DEBUG override rlang = "1.0.6" ignores lifecycle 1.0.5's requirement rlang (>=1.1.0)
+```
+
+R also checks the versions of imports when it loads a package, so a package
+can fail to load with an overridden dependency.
+
+A constraint is a version range that a package must also satisfy. It does
+not add the package to the project: a constraint on a package that nothing
+pulls in has no effect. If no version satisfies both the constraint and the
+requirements, the lock fails and shows the combined range.
+
+Both tables work with all resolution strategies, and an override can select
+an old CRAN release (uvr gets it as described above). They apply to CRAN,
+Bioconductor, and custom-repository packages. A Bioconductor release has one
+version of each package, thus an override there can only select that
+version. An override on a git
+dependency is an error: pin a git dependency with `rev`. A constraint on a git
+dependency is checked like any other requirement.
 
 ---
 

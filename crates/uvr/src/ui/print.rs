@@ -7,16 +7,43 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::{glyph, palette};
+
+/// Set by `uvr run`: stdout belongs to the script, so uvr's own status lines
+/// (install summaries, rename notes) go to stderr for the rest of the run.
+static STDOUT_RESERVED: AtomicBool = AtomicBool::new(false);
+
+/// Send every status line below to stderr from now on.
+pub fn reserve_stdout() {
+    STDOUT_RESERVED.store(true, Ordering::Relaxed);
+}
+
+/// `println!`, or `eprintln!` once [`reserve_stdout`] has been called.
+macro_rules! out {
+    ($($arg:tt)*) => {
+        if STDOUT_RESERVED.load(Ordering::Relaxed) {
+            eprintln!($($arg)*)
+        } else {
+            println!($($arg)*)
+        }
+    };
+}
+
+/// A preformatted status line, on stdout unless [`reserve_stdout`] is set.
+pub fn line(text: impl std::fmt::Display) {
+    out!("{text}");
+}
 
 /// `✓ <text>` in green bold glyph, plain text.
 pub fn success(text: impl std::fmt::Display) {
-    println!("{} {text}", palette::success(glyph::success()));
+    out!("{} {text}", palette::success(glyph::success()));
 }
 
 /// `✗ <text>` in red bold.
 pub fn fail(text: impl std::fmt::Display) {
-    println!("{} {text}", palette::fail(glyph::fail()));
+    out!("{} {text}", palette::fail(glyph::fail()));
 }
 
 /// Single-line warning: `⚠ Warning: <text>`.
@@ -53,7 +80,7 @@ pub fn warn_block(headline: &str, body: impl IntoIterator<Item = String>) {
 
 /// `› <text>` — informational headline.
 pub fn info(text: impl std::fmt::Display) {
-    println!("{} {text}", palette::info(glyph::info()));
+    out!("{} {text}", palette::info(glyph::info()));
 }
 
 /// `› <text>` on **stderr** — informational headline that belongs with the
@@ -87,7 +114,7 @@ pub fn hint(text: impl std::fmt::Display) {
 
 /// Indented bullet: `  · <text>`.
 pub fn bullet(text: impl std::fmt::Display) {
-    println!("  {} {text}", palette::dim(glyph::bullet()));
+    out!("  {} {text}", palette::dim(glyph::bullet()));
 }
 
 /// Indented bullet `  · <text>` on **stderr** — the [`info_err`] counterpart,
@@ -98,7 +125,7 @@ pub fn bullet_err(text: impl std::fmt::Display) {
 
 /// Indented bullet with explicit dim body — for metadata under a header.
 pub fn bullet_dim(text: impl std::fmt::Display) {
-    println!("  {} {}", palette::dim(glyph::bullet()), palette::dim(text));
+    out!("  {} {}", palette::dim(glyph::bullet()), palette::dim(text));
 }
 
 /// Dim continuation line under a [`bullet_err`], indented one level further:
@@ -119,7 +146,7 @@ pub fn note_err(text: impl std::fmt::Display) {
 
 /// `<glyph> <pkg-name> <version>` — a single row in a change list.
 pub fn row(glyph_str: console::StyledObject<&str>, name: &str, version: &str) {
-    println!(
+    out!(
         "  {glyph_str} {} {}",
         palette::pkg(name),
         palette::version(version)
@@ -128,7 +155,7 @@ pub fn row(glyph_str: console::StyledObject<&str>, name: &str, version: &str) {
 
 /// Upgrade row: `↑ pkg old → new` with magenta accent on the new version.
 pub fn row_upgrade(name: &str, from: &str, to: &str) {
-    println!(
+    out!(
         "  {} {} {} {} {}",
         palette::upgraded(glyph::upgrade()),
         palette::pkg(name),
@@ -139,7 +166,7 @@ pub fn row_upgrade(name: &str, from: &str, to: &str) {
 }
 
 pub fn row_added(name: &str, version: &str) {
-    println!(
+    out!(
         "  {} {} {}",
         palette::added(glyph::add()),
         palette::pkg(name),
@@ -148,7 +175,7 @@ pub fn row_added(name: &str, version: &str) {
 }
 
 pub fn row_removed(name: &str, version: &str) {
-    println!(
+    out!(
         "  {} {} {}",
         palette::removed(glyph::remove()),
         palette::pkg(name),
@@ -158,14 +185,21 @@ pub fn row_removed(name: &str, version: &str) {
 
 /// Section header with bold title. No horizontal rule — rule-less by choice.
 pub fn section(title: &str) {
-    println!();
-    println!("{}", palette::bold(title));
+    out!();
+    out!("{}", palette::bold(title));
 }
 
 /// Two-line summary: headline `✓ <headline>` and dim `  <sub>` subtitle.
 pub fn summary(headline: impl std::fmt::Display, sub: impl std::fmt::Display) {
-    println!("{} {headline}", palette::success(glyph::success()));
-    println!("  {}", palette::dim(sub));
+    out!("{} {headline}", palette::success(glyph::success()));
+    out!("  {}", palette::dim(sub));
+}
+
+/// [`summary`] on **stderr**, for a step that must not mix into a command's
+/// data output — `uvr run` installing R before it runs a script.
+pub fn summary_err(headline: impl std::fmt::Display, sub: impl std::fmt::Display) {
+    eprintln!("{} {headline}", palette::success(glyph::success()));
+    eprintln!("  {}", palette::dim(sub));
 }
 
 /// Single-line padded check for doctor: `{glyph} {label:<width}} {status}`.

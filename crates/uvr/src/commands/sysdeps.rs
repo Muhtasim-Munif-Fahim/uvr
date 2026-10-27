@@ -82,8 +82,11 @@ async fn report(lockfile: &uvr_core::lockfile::Lockfile, all: bool) -> Result<()
         })
         .collect();
 
-    let client = reqwest::Client::new();
-    let check = sysreqs::check_system_deps(&client, &queries, &distro).await;
+    let client = crate::commands::util::build_client()?;
+    let check = sysreqs::check_system_deps(&client, &queries, &distro).await?;
+    for description in &check.overrides_applied {
+        ui::info(format!("System dependency override: {description}"));
+    }
 
     // `--all` answers "what does this project need", `missing` answers "what
     // is absent from this host". The first is the Dockerfile question, since
