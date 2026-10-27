@@ -29,6 +29,45 @@ Pure tracking section — fixes and small features land here between tags.
   different mounts fall back to a copy, as they already did on Windows.
   Existing symlinked libraries migrate one package at a time on their next
   sync, with no separate step.
+- **`uvr cache dir`, `uvr cache size`, `uvr r dir` and `uvr r find
+  [constraint]`** (#191). Small read-only commands, like `uv cache dir/size`
+  and `uv python dir/find`, for scripts, CI, and debugging somebody else's
+  setup. Each prints only the path or size on stdout, so `$(uvr r find)`
+  works. `cache size` is the download cache plus the extracted packages. `r dir`
+  honours `UVR_R_INSTALL_DIR`. `r find` prints the newest working R that
+  satisfies the constraint. It ignores a `.r-version` pin here, so the
+  printed R always satisfies the constraint. With no constraint it prints the R the project uses (pin, then the
+  `uvr.toml` constraint, then the newest R). It exits non-zero when no
+  installed R matches.
+- **`uvr cache prune`** (#192). Reclaims cache space without the full
+  re-download that `uvr cache clean` causes for every project. It removes
+  only what no sync can use: partial downloads, `.sha256` sidecars whose
+  tarball is gone, and staging directories left by an interrupted install
+  or git fetch,
+  plus extracted packages built for an R minor version that uvr cannot find
+  on this machine. A download without an extract is kept. Leftovers changed
+  less than an hour ago are kept and reported, because a sync that is still
+  running has the same files. When uvr finds no R at all, it keeps every
+  extract. `--dry-run` lists each entry and removes
+  nothing; `--ci` (like `uv cache prune --ci`) also removes the raw download
+  cache and keeps the extracted packages. The output gives the count and the
+  bytes for each category.
+- **Depend on a package you develop next to the project: `uvr add ../mypkg`**
+  (#188). An argument that starts with `.` or `/` (or is an absolute path)
+  is a local source directory; it is recorded as
+  `mypkg = { path = "../mypkg" }`, keyed by the DESCRIPTION `Package:` name
+  and relative to `uvr.toml` even when typed from a subdirectory. A bare
+  `name` or `owner/repo` keeps its old meaning, even if a directory of that
+  name exists. The lock records `source = "local:../mypkg"` with the
+  DESCRIPTION version, and its `Imports`/`Depends`/`LinkingTo` (and
+  `Remotes:`, as for a manifest git dependency) resolve like any other
+  package's. Sync builds the directory with `R CMD INSTALL` on every run,
+  so edits arrive without a version bump (a new version or a new import
+  re-resolves the lock on the next `uvr lock` or `uvr sync`), and never puts it in the global
+  package cache or swaps it for a same-named binary. A missing directory or
+  one without a DESCRIPTION `Package:` fails with a clear error, and
+  `uvr sync --frozen` warns that such a lockfile is not reproducible on
+  other machines. `uvr export` writes renv's `Source: Local` record.
 
 ## v0.4.8 (2026-10-22)
 
@@ -414,43 +453,6 @@ Two changes may need action:
   dependency, and it checks installed and cached packages against the commit.
 - **Distro suite maintenance:** refreshed the Alpine 3.21/3.22 image versions.
 
-- **`uvr cache dir`, `uvr cache size`, `uvr r dir` and `uvr r find
-  [constraint]`** (#191). Small read-only commands, like `uv cache dir/size`
-  and `uv python dir/find`, for scripts, CI, and debugging somebody else's
-  setup. Each prints only the path or size on stdout, so `$(uvr r find)`
-  works. `cache size` is the download cache plus the extracted packages. `r dir`
-  honours `UVR_R_INSTALL_DIR`. `r find` prints the newest working R that
-  satisfies the constraint. It ignores a `.r-version` pin here, so the
-  printed R always satisfies the constraint. With no constraint it prints the R the project uses (pin, then the
-  `uvr.toml` constraint, then the newest R). It exits non-zero when no
-  installed R matches.
-- **`uvr cache prune`** (#192). Reclaims cache space without the full
-  re-download that `uvr cache clean` causes for every project. It removes
-  only what no sync can use: partial downloads, `.sha256` sidecars whose
-  tarball is gone, and staging directories left by an interrupted install,
-  plus extracted packages built for an R minor version that uvr cannot find
-  on this machine. A download without an extract is kept. Leftovers changed
-  less than an hour ago are kept and reported, because a sync that is still
-  running has the same files. When uvr finds no R at all, it keeps every
-  extract. `--dry-run` lists each entry and removes
-  nothing; `--ci` (like `uv cache prune --ci`) also removes the raw download
-  cache and keeps the extracted packages. The output gives the count and the
-  bytes for each category.
-- **Depend on a package you develop next to the project: `uvr add ../mypkg`**
-  (#188). An argument that starts with `.` or `/` (or is an absolute path)
-  is a local source directory; it is recorded as
-  `mypkg = { path = "../mypkg" }`, keyed by the DESCRIPTION `Package:` name
-  and relative to `uvr.toml` even when typed from a subdirectory. A bare
-  `name` or `owner/repo` keeps its old meaning, even if a directory of that
-  name exists. The lock records `source = "local:../mypkg"` with the
-  DESCRIPTION version, and its `Imports`/`Depends`/`LinkingTo` (and
-  `Remotes:`, as for a manifest git dependency) resolve like any other
-  package's. Sync builds the directory with `R CMD INSTALL` on every run,
-  so edits arrive without a version bump, and never puts it in the global
-  package cache or swaps it for a same-named binary. A missing directory or
-  one without a DESCRIPTION `Package:` fails with a clear error, and
-  `uvr sync --frozen` warns that such a lockfile is not reproducible on
-  other machines. `uvr export` writes renv's `Source: Local` record.
 
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption
