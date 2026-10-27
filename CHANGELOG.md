@@ -418,12 +418,24 @@ Two changes may need action:
   [constraint]`** (#191). Small read-only commands, like `uv cache dir/size`
   and `uv python dir/find`, for scripts, CI, and debugging somebody else's
   setup. Each prints only the path or size on stdout, so `$(uvr r find)`
-  works. `cache size` adds up the two figures `uvr doctor` shows. `r dir`
+  works. `cache size` is the download cache plus the extracted packages. `r dir`
   honours `UVR_R_INSTALL_DIR`. `r find` prints the newest working R that
   satisfies the constraint. It ignores a `.r-version` pin here, so the
   printed R always satisfies the constraint. With no constraint it prints the R the project uses (pin, then the
   `uvr.toml` constraint, then the newest R). It exits non-zero when no
   installed R matches.
+- **`uvr cache prune`** (#192). Reclaims cache space without the full
+  re-download that `uvr cache clean` causes for every project. It removes
+  only what no sync can use: partial downloads, `.sha256` sidecars whose
+  tarball is gone, and staging directories left by an interrupted install,
+  plus extracted packages built for an R minor version that uvr cannot find
+  on this machine. A download without an extract is kept. Leftovers changed
+  less than an hour ago are kept and reported, because a sync that is still
+  running has the same files. When uvr finds no R at all, it keeps every
+  extract. `--dry-run` lists each entry and removes
+  nothing; `--ci` (like `uv cache prune --ci`) also removes the raw download
+  cache and keeps the extracted packages. The output gives the count and the
+  bytes for each category.
 
 - **macOS: the OpenMP shim now reaches CRAN's own R, not just uvr-managed
   installs** (#261). uvr skipped the shim for a system R on the assumption

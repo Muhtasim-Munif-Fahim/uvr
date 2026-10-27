@@ -635,6 +635,22 @@ pub enum CacheCommands {
 
     /// Print the size of the download and extracted-package caches, as `uvr doctor` reports them
     Size,
+
+    /// Remove only unused cache entries: leftovers from interrupted installs,
+    /// and extracted packages built for an R minor version that is not installed
+    Prune(CachePruneArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CachePruneArgs {
+    /// List what would be removed, and remove nothing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Also remove the raw download cache and keep the extracted packages
+    /// (like `uv cache prune --ci`), before a CI job saves its cache
+    #[arg(long)]
+    pub ci: bool,
 }
 
 #[derive(Debug, Args)]

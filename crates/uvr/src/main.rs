@@ -264,6 +264,9 @@ async fn run() -> Result<()> {
             Some(CacheCommands::Size) => {
                 commands::cache::run_size();
             }
+            Some(CacheCommands::Prune(args)) => {
+                commands::cache::run_prune(args.dry_run, args.ci)?;
+            }
             None => {
                 ui::welcome_group(
                     "cache",
@@ -280,6 +283,10 @@ async fn run() -> Result<()> {
                         ),
                         ("uvr cache dir", "Print the download cache directory"),
                         ("uvr cache size", "Print the total cache size"),
+                        (
+                            "uvr cache prune",
+                            "Remove only unused entries (--dry-run to preview)",
+                        ),
                     ],
                 );
             }
