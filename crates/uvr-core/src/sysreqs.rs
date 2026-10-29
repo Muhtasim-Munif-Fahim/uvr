@@ -645,6 +645,14 @@ pub struct SysReqsCheck {
     pub overrides_applied: Vec<String>,
     /// Missing system packages keyed by R package name.
     pub missing: HashMap<String, Vec<SysReq>>,
+    /// Every system package a rule resolved, keyed by R package name —
+    /// whether or not it is already installed. `missing` is a subset.
+    ///
+    /// Populated for `uvr sysdeps --all` (#256), which answers "what does
+    /// this project need" rather than "what is absent here". A Dockerfile
+    /// wants the whole list: the image being built has none of it yet, so
+    /// filtering against the *current* host is exactly the wrong question.
+    pub resolved: HashMap<String, Vec<SysReq>>,
     /// Set when the Posit API reported the distro as unsupported.
     /// When true, the API contributed nothing — but the vendored local
     /// rules still ran, so `missing` may well be authoritative. Read this
@@ -780,6 +788,10 @@ fn apply_index(
             // requirements, which is the common case.
             continue;
         };
+        if !entry.packages.is_empty() {
+            out.resolved
+                .insert(pkg.name.clone(), entry.packages.clone());
+        }
         let missing = filter_with_overrides(out, &entry.packages, distro, overrides);
         if !missing.is_empty() {
             // Same rule as the local path: setup commands only matter when
@@ -834,6 +846,7 @@ fn check_pkg_local(
     // Past this point the local rules produced a real answer for this
     // package, whether or not anything turns out to be missing.
     out.local_resolved += 1;
+    out.resolved.insert(pkg.name.clone(), resolved.clone());
     let missing = filter_with_overrides(out, &resolved, distro, overrides);
     if !missing.is_empty() {
         // Setup commands only matter when something is actually missing —
@@ -1462,6 +1475,69 @@ mod tests {
         assert_eq!(
             out.local_resolved, 0,
             "curl is in the index, so the local rules must be bypassed entirely"
+        );
+    }
+
+    #[test]
+    fn resolved_records_index_deps_regardless_of_what_is_installed() {
+        // #256: `uvr sysdeps --all` asks "what does this project need",
+        // not "what is absent from this host". A Dockerfile needs the
+        // former — the image being built has none of it yet — so `resolved`
+        // is populated before `filter_missing` runs and is independent of
+        // whether dpkg/rpm/apk exist here at all.
+        let mut index = HashMap::new();
+        index.insert(
+            "xml2".to_string(),
+            SysReqIndexEntry {
+                packages: vec![SysReq {
+                    package: "libxml2-dev".to_string(),
+                }],
+                ..Default::default()
+            },
+        );
+        let mut out = SysReqsCheck::default();
+        let packages = vec![PackageSysReqQuery {
+            name: "xml2".to_string(),
+            system_requirements: None,
+            bioc: false,
+        }];
+        apply_index(
+            &mut out,
+            &packages,
+            Some(&index),
+            "ubuntu-22.04",
+            &crate::sysreqs_overrides::Overrides::default(),
+        );
+
+        let deps = out.resolved.get("xml2").expect("xml2 must be recorded");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].package, "libxml2-dev");
+    }
+
+    #[test]
+    fn resolved_records_local_rule_deps_too() {
+        // The vendored-rules path must populate `resolved` as well, or
+        // `--all` would go quiet on exactly the distros that depend on the
+        // fallback (Alpine, Fedora) while still reporting missing deps.
+        let mut out = SysReqsCheck::default();
+        let packages = vec![PackageSysReqQuery {
+            name: "curl".to_string(),
+            system_requirements: Some("libcurl".to_string()),
+            bioc: false,
+        }];
+        apply_index(
+            &mut out,
+            &packages,
+            None,
+            "ubuntu-22.04",
+            &crate::sysreqs_overrides::Overrides::default(),
+        );
+
+        assert_eq!(out.local_resolved, 1, "the local rules must have matched");
+        assert!(
+            out.resolved.contains_key("curl"),
+            "resolved: {:?}",
+            out.resolved
         );
     }
 

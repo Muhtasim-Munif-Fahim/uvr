@@ -68,6 +68,14 @@ Pure tracking section — fixes and small features land here between tags.
   one without a DESCRIPTION `Package:` fails with a clear error, and
   `uvr sync --frozen` warns that such a lockfile is not reproducible on
   other machines. `uvr export` writes renv's `Source: Local` record.
+- **`uvr sysdeps` reports a project's system dependencies without syncing**
+  (#256). The sysreqs machinery ran only inside `uvr sync`, so there was no
+  way to ask what a project needs before installing it — the question a
+  Dockerfile or a CI setup step actually has. Reads `uvr.lock` and exits
+  non-zero when anything is missing, so CI can gate on it. `--all` lists
+  every resolved dependency whether or not it is installed here, and exits 0:
+  an image being built has none of it yet, so filtering against the current
+  host is the wrong question. Linux-only, like the check it wraps.
 
 ## v0.4.8 (2026-10-22)
 
