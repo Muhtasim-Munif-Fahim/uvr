@@ -515,9 +515,12 @@ export UVR_USER_PROFILE=1
 A script or an install then reads `R_PROFILE_USER` if you set it, else
 `~/.Rprofile`, and never the project's `.Rprofile`. A session in the project
 sources `~/.Rprofile` from uvr's block, before the block adds the project
-library. The block comes from `uvr init` and `uvr sync`, so run one of them
-once after you upgrade. For an IDE session that does not start from your
-shell, put `UVR_USER_PROFILE=1` in `~/.Renviron`.
+library. uvr adds those lines to the block the first time `uvr init` or
+`uvr sync` runs with the switch set, so run one of them once that way. A
+project nobody opted in for keeps its `.Rprofile` unchanged, and a teammate
+without the switch keeps the lines (they do nothing in a session without it).
+For an IDE session that does not start from your shell, put
+`UVR_USER_PROFILE=1` in `~/.Renviron` too.
 
 With the switch on, a `~/.Rprofile` that changes `.libPaths()` also changes
 the library a headered script sees. That is the trade the switch makes.

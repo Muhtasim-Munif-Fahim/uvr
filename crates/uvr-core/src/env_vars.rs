@@ -300,10 +300,7 @@ fn derive_name_from_url(url: &str) -> String {
 /// environment variable rather than a `uvr.toml` key a collaborator would
 /// inherit.
 pub fn user_profile() -> bool {
-    matches!(
-        read_env_var("UVR_USER_PROFILE").as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("TRUE") | Some("YES")
-    )
+    truthy("UVR_USER_PROFILE")
 }
 
 /// The value for `R_PROFILE_USER` in an R that must not read the *project*
